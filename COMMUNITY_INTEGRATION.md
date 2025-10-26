@@ -22,13 +22,13 @@ This branch combines the following pull requests:
 
 3. **PR #237** - Add auto dark mode detection by [@rugk](https://github.com/rugk)
    - Automatic dark/light theme based on system preferences
-   
+
 4. **PR #248** - Animation removed from search-box by [@apoorvlathey](https://github.com/apoorvlathey)
    - Fixes CSS overlap bug
-   
+
 5. **PR #293** - Better shell examples by [@Strahinja](https://github.com/Strahinja)
    - Removes deprecated backticks and anti-patterns
-   
+
 6. **PR #232** - Update to Ubuntu noble manpages by [@wesinator](https://github.com/wesinator)
    - Updated to latest Ubuntu LTS man pages
 
@@ -41,18 +41,21 @@ This branch combines the following pull requests:
 ## Key Improvements
 
 ### 🔐 Security
+
 - ✅ Python 2.7 (EOL 2020) → Python 3.12
 - ✅ Flask 0.12 → 3.0.3 (fixes CVE-2023-30861)
 - ✅ nltk 3.4.5 → 3.9.1 (fixes ReDoS vulnerabilities)
 - ✅ pymongo 3.13.0 → 4.8.0 with compatibility fixes
 
 ### 🎨 User Experience
+
 - ✅ Automatic dark mode support
 - ✅ Fixed search box animation
 - ✅ Better shell command examples
 - ✅ Updated documentation for modern tools
 
 ### 🔧 Developer Experience
+
 - ✅ Modern Python 3.12 syntax
 - ✅ Improved logging with loguru
 - ✅ Better code formatting
@@ -83,7 +86,7 @@ loguru==0.7.2
 docker compose up --build
 ```
 
-The application will be available at http://localhost:5000
+The application will be available at <http://localhost:5000>
 
 ### Using Python directly
 
@@ -151,10 +154,10 @@ Same as the original project (GPL-3.0)
 
 ## Links
 
-- 🏠 **Original Repository**: https://github.com/idank/explainshell
-- 🍴 **This Fork**: https://github.com/tobiashochguertel/explainshell
+- 🏠 **Original Repository**: <https://github.com/idank/explainshell>
+- 🍴 **This Fork**: <https://github.com/tobiashochguertel/explainshell>
 - 📊 **PR Analysis**: [PR_ANALYSIS.md](./PR_ANALYSIS.md)
-- 🐛 **Issues**: https://github.com/idank/explainshell/issues
+- 🐛 **Issues**: <https://github.com/idank/explainshell/issues>
 
 ---
 
