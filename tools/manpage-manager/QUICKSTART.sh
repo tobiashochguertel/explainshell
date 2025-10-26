@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Quick start guide - Run this to see what the tool can do
 
 set -e
@@ -11,7 +11,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # Colors
-RED='\033[0;31m'
+# RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
@@ -180,11 +180,11 @@ echo ""
 echo -e "${GREEN}🎉 READY TO START!${NC}"
 echo ""
 echo -e "${YELLOW}Next Steps:${NC}"
-echo "  1. Run installation:    ${CYAN}./install.sh${NC}"
-echo "  2. View demo:           ${CYAN}./demo.py${NC}"
-echo "  3. Check for updates:   ${CYAN}manpage-mgr check-update${NC}"
-echo "  4. Download dump:       ${CYAN}manpage-mgr download${NC}"
-echo "  5. Get help:            ${CYAN}manpage-mgr --help${NC}"
+echo -e "  1. Run installation:    ${CYAN}./install.sh${NC}"
+echo -e "  2. View demo:           ${CYAN}./demo.py${NC}"
+echo -e "  3. Check for updates:   ${CYAN}manpage-mgr check-update${NC}"
+echo -e "  4. Download dump:       ${CYAN}manpage-mgr download${NC}"
+echo -e "  5. Get help:            ${CYAN}manpage-mgr --help${NC}"
 echo ""
 echo -e "${GREEN}Happy managing! 🚀${NC}"
 echo ""

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Development environment preparation script for manpage-manager
 
 set -e

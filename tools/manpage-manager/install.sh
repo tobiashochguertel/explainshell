@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # User installation script for manpage-manager (system-wide or user install)
 
 set -e
