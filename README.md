@@ -14,6 +14,7 @@ This is a community-maintained fork of [idank/explainshell](https://github.com/i
 ## 🆕 What's New in This Fork
 
 This fork integrates **6 valuable community pull requests** from the original repository:
+This fork integrates **6 valuable community pull requests** from the original repository:
 
 | Feature | Status | PR | Contributor |
 |---------|--------|-----|-------------|
@@ -26,6 +27,15 @@ This fork integrates **6 valuable community pull requests** from the original re
 
 **See [COMMUNITY_INTEGRATION.md](./COMMUNITY_INTEGRATION.md) for detailed information.**
 
+## ⚠️ Manpages Status
+
+> [!IMPORTANT]
+>
+> explainshell is actively maintained in terms of keeping it healthy and functional -- issues are addressed, and the core remains stable.
+>
+> However, please note that the **manpages are outdated**. The previous system for generating them was unsustainable, and they haven't been updated in some time. There are currently **no active plans** to revise this mechanism.
+>
+> If you're relying on manpages, be aware that they may not reflect the latest behavior. Contributions in this area are welcome but would require rethinking the documentation pipeline.
 ---
 
 ## 📋 Table of Contents
