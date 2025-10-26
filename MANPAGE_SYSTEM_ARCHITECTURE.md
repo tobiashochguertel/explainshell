@@ -1,8 +1,8 @@
 # Manpage System Architecture - Current Implementation Analysis
 
-**Date**: October 26, 2025
-**Repository**: explainshell  
-**Purpose**: Deep dive into the existing manpage generation and storage system
+- **Date**: October 26, 2025
+- **Repository**: explainshell
+- **Purpose**: Deep dive into the existing manpage generation and storage system
 
 ---
 
@@ -23,7 +23,7 @@ This document provides a comprehensive analysis of explainshell's manpage system
 
 ### High-Level Flow
 
-```
+```text
 ┌──────────────────┐
 │ Ubuntu Man Pages │ (.1.gz files in /manpages/)
 └────────┬─────────┘
@@ -48,7 +48,7 @@ This document provides a comprehensive analysis of explainshell's manpage system
          │
          ▼ (4) store.py saves
 ┌──────────────────┐
-│    MongoDB       │ 
+│    MongoDB       │
 │  - manpage coll  │
 │  - mapping coll  │
 │  - classifier    │
@@ -69,7 +69,7 @@ This document provides a comprehensive analysis of explainshell's manpage system
 class ManPage:
     def __init__(self, path):
         self.path = path  # e.g., "/manpages/1/ls.1.gz"
-        
+
     def read(self):
         # Decompress .gz file
         # Run through `man` command with special env vars
@@ -80,7 +80,7 @@ class ManPage:
             "LC_ALL": "en_US.UTF-8"
         }
         # Captures HTML output
-        
+
     def parse(self):
         # Parse HTML to extract:
         # - NAME section
@@ -91,11 +91,13 @@ class ManPage:
 ```
 
 **Dependencies**:
+
 - System `man` command
 - w3mman2html.cgi (converts man → HTML)
 - Special UTF-8 handling for groff quirks
 
 **Known Issues**:
+
 - UTF-8 encoding problems (fixed in commit 1ec31a3)
 - Inconsistent groff formatting across man pages
 - Requires system packages (`man-db`)
@@ -109,22 +111,25 @@ class ManPage:
 **Collections**:
 
 1. **`manpage`** - Stores parsed man pages
+
    ```python
    class ManPage:
        source: str        # "ls.1.gz"
        name: str          # "ls"
        synopsis: str      # "ls [OPTION]... [FILE]..."
        paragraphs: list   # List of Paragraph objects
-       options: list      # List of Option objects  
+       options: list      # List of Option objects
        aliases: list      # [(name, priority), ...]
    ```
 
 2. **`mapping`** - Maps command names to manpages
+
    ```python
    # Direct index: command_name → manpage_id
    ```
 
 3. **`classifier`** - Stores ML model data
+
    ```python
    # Pickled scikit-learn Bayes classifier
    ```
@@ -153,24 +158,25 @@ class Manager:
         self.store = Store(dbname, db_host)
         self.classifier = Classifier(self.store, "bayes")
         self.classifier.train()
-        
+
     def process(self, manpage_path):
         # 1. Read & parse manpage
         m = ManPage(manpage_path)
         m.read()
         m.parse()
-        
+
         # 2. Classify paragraphs (ML)
         classifier.classify(m)
-        
+
         # 3. Extract options
         options.extract(m)
-        
+
         # 4. Save to MongoDB
         self.store.add_manpage(m)
 ```
 
 **Commands** (inferred from code):
+
 - Process man pages from directories
 - Build classifier from existing data
 - Find multi-command manpages
@@ -183,12 +189,14 @@ class Manager:
 **Purpose**: Parse option syntax from man page text
 
 **What it does**:
+
 - Identifies `-s`, `--long` style options
 - Extracts descriptions
 - Handles complex formats like `[-abc] | --all`
 - Detects options that take arguments
 
 **Challenges**:
+
 - Man pages have inconsistent formatting
 - Options can span multiple lines
 - Nested syntax (e.g., `tar -xvf`)
@@ -200,11 +208,13 @@ class Manager:
 **Purpose**: Define bash built-in commands manually
 
 **Why needed**:
+
 - Bash builtins (`cd`, `export`, `source`) don't have man pages
 - Bash's builtin documentation isn't parseable by explainshell
 - Solution: Manually define these commands
 
 **Example**:
+
 ```python
 BUILTINS['cd'] = ManPage(
     "bash-cd.1.gz",
@@ -228,7 +238,7 @@ BUILTINS['cd'] = ManPage(
   name: "ls",
   source: "ls.1.gz",
   synopsis: "ls [OPTION]... [FILE]...",
-  
+
   paragraphs: [
     {
       section: "NAME",
@@ -236,7 +246,7 @@ BUILTINS['cd'] = ManPage(
       is_option: false
     },
     {
-      section: "DESCRIPTION", 
+      section: "DESCRIPTION",
       text: "List information about the FILEs...",
       is_option: false
     },
@@ -246,11 +256,11 @@ BUILTINS['cd'] = ManPage(
       is_option: true
     }
   ],
-  
+
   options: [
     {
       short: ["-a"],
-      long: ["--all"],  
+      long: ["--all"],
       argument: null,
       description: "do not ignore entries starting with .",
       expectsarg: false,
@@ -265,7 +275,7 @@ BUILTINS['cd'] = ManPage(
       nestedcommand: null
     }
   ],
-  
+
   aliases: [
     ["ls", 10],
     ["dir", 5]   // Lower priority alternative
@@ -312,6 +322,7 @@ python explainshell/manager.py \
 ```
 
 **What happens**:
+
 1. For each `.1.gz` file:
    - Decompress
    - Run through `man` command
@@ -321,7 +332,7 @@ python explainshell/manager.py \
 3. Extract option syntax
 4. Save to MongoDB
 
-**Time**: ~10-30 seconds per man page  
+**Time**: ~10-30 seconds per man page
 **Total for 30k pages**: 5-15 hours 😱
 
 #### Step 3: Build Classifier
@@ -358,6 +369,7 @@ Creates the 70MB dump file that users download.
 ### Problem 1: Manual Labor Intensive
 
 **Effort Required**:
+
 - Download 100s of `.deb` packages
 - Extract man pages
 - Copy to correct directories
@@ -374,13 +386,15 @@ Creates the 70MB dump file that users download.
 ### Problem 2: Parsing Failures
 
 **Issues**:
+
 - Groff format varies between packages
 - UTF-8 encoding problems
 - Malformed man pages
 - Complex nested formatting
 
 **Example failure**:
-```
+
+```text
 ERROR: Failed to parse tar.1.gz
   Reason: Unexpected groff macro '.XX'
 ```
@@ -392,7 +406,8 @@ ERROR: Failed to parse tar.1.gz
 ### Problem 3: Single Distribution
 
 **Current**: Only Ubuntu man pages
-**Problem**: 
+**Problem**:
+
 - Debian: Different versions
 - Arch: Rolling release, always newer
 - macOS: BSD man pages, totally different
@@ -405,12 +420,14 @@ ERROR: Failed to parse tar.1.gz
 ### Problem 4: No Version Control
 
 **Problem**:
+
 - Can't see what changed between updates
 - No rollback if parsing breaks
 - No diffing between Ubuntu versions
 
 **Example**:
-```
+
+```text
 User: "Your tar explanation is wrong!"
 Us: "Which Ubuntu version?"
 User: "I don't know"
@@ -422,6 +439,7 @@ Us: "..."
 ### Problem 5: Infrastructure Requirements
 
 **To automate, you'd need**:
+
 - Scheduled jobs (cron/GitHub Actions)
 - Storage for multiple versions
 - Testing framework
@@ -437,24 +455,24 @@ Us: "..."
 
 ## ✅ What's NOT Broken
 
-### The parser works fine:
+### The parser works fine
 
 ```bash
 $ python -c "from explainshell import manpage; m = manpage.ManPage('manpages/1/ls.1.gz'); m.read(); m.parse(); print(m.synopsis)"
 ls [OPTION]... [FILE]...
 ```
 
-✅ No issues with Python 3.12  
-✅ Parsing logic is solid  
-✅ Option extraction works  
-✅ Database schema is efficient  
+✅ No issues with Python 3.12
+✅ Parsing logic is solid
+✅ Option extraction works
+✅ Database schema is efficient
 
-### The application works great:
+### The application works great
 
-✅ Web interface responsive  
-✅ Command matching accurate  
-✅ Help text display clear  
-✅ Dark mode functional  
+✅ Web interface responsive
+✅ Command matching accurate
+✅ Help text display clear
+✅ Dark mode functional
 
 ---
 
@@ -462,14 +480,14 @@ ls [OPTION]... [FILE]...
 
 ### What We Have Today
 
-```
+```text
 Source: Ubuntu archive (likely 18.04-20.04 era)
 Created: ~2018-2020 (estimate from commit history)
 Last Update: Unknown (no automation)
 
 Collections:
 - manpage: 29,763 documents
-- mapping: 42,069 entries  
+- mapping: 42,069 entries
 - classifier: 517 data points
 
 Total Size: 70.6 MB (compressed)
@@ -478,11 +496,13 @@ Total Size: 70.6 MB (compressed)
 ### How to Access
 
 The existing database is available at:
-```
+
+```text
 https://github.com/idank/explainshell/releases/download/untagged-cafe24816eff4a18638c/explainshell.mongodump.gz
 ```
 
 Restore with:
+
 ```bash
 curl -L -o dump.gz <URL>
 mongorestore --archive=dump.gz --gzip
@@ -519,9 +539,9 @@ python tools/shellbuiltins.py
 mongodump --db explainshell --archive=dump.gz --gzip
 ```
 
-**Time**: 2-4 hours for basic commands  
-**Coverage**: ~500 commands  
-**Completeness**: Partial
+- **Time**: 2-4 hours for basic commands
+- **Coverage**: ~500 commands
+- **Completeness**: Partial
 
 ---
 
@@ -548,11 +568,12 @@ python tools/shellbuiltins.py
 mongodump --db explainshell --archive=dump.gz --gzip
 ```
 
-**Time**: 12-24 hours total  
-**Coverage**: 30,000+ commands  
-**Completeness**: Full Ubuntu coverage
+- **Time**: 12-24 hours total
+- **Coverage**: 30,000+ commands
+- **Completeness**: Full Ubuntu coverage
 
 **Challenges**:
+
 - Parsing failures on some man pages
 - Memory requirements (8GB+ recommended)
 - Disk space (100GB+ during process)
@@ -564,11 +585,13 @@ mongodump --db explainshell --archive=dump.gz --gzip
 ### For Now: Use Existing Database ✅
 
 **Rationale**:
+
 - Current database works fine
 - Covers 99% of common commands
 - No effort required
 
 **When to consider updating**:
+
 - Major Ubuntu LTS release (every 2 years)
 - Critical command changes
 - User complaints about inaccuracy
@@ -578,6 +601,7 @@ mongodump --db explainshell --archive=dump.gz --gzip
 ### For Future: Semi-Automated Pipeline
 
 **Phase 1: Script the Download**
+
 ```bash
 #!/bin/bash
 # download-manpages.sh
@@ -588,15 +612,17 @@ mongodump --db explainshell --archive=dump.gz --gzip
 ```
 
 **Phase 2: Automated Parsing**
+
 ```bash
 #!/bin/bash
-# parse-manpages.sh  
+# parse-manpages.sh
 # - Run manager.py on all files
 # - Log successes and failures
 # - Generate statistics report
 ```
 
 **Phase 3: Quality Check**
+
 ```bash
 #!/bin/bash
 # validate-database.sh
@@ -607,6 +633,7 @@ mongodump --db explainshell --archive=dump.gz --gzip
 ```
 
 **Phase 4: Deploy**
+
 ```bash
 #!/bin/bash
 # deploy-database.sh
@@ -615,9 +642,9 @@ mongodump --db explainshell --archive=dump.gz --gzip
 # - Update documentation
 ```
 
-**Effort**: 20-40 hours initial dev  
-**Maintenance**: 2-4 hours per update  
-**Frequency**: Every 6-12 months
+- **Effort**: 20-40 hours initial dev
+- **Maintenance**: 2-4 hours per update
+- **Frequency**: Every 6-12 months
 
 ---
 
@@ -627,7 +654,8 @@ mongodump --db explainshell --archive=dump.gz --gzip
 
 > "The previous system for generating them was unsustainable"
 
-**Translation**: 
+**Translation**:
+
 - Manual process taking 12+ hours
 - No automation
 - Prone to errors
@@ -642,6 +670,7 @@ mongodump --db explainshell --archive=dump.gz --gzip
 > "There are currently no active plans to revise this mechanism"
 
 **Translation**:
+
 - Original maintainer won't manually update
 - No bandwidth to build automation
 - Open to community contributions
@@ -653,11 +682,13 @@ mongodump --db explainshell --archive=dump.gz --gzip
 ### What's Actually Needed
 
 **Not needed**:
+
 - Rewrite the parser ❌
 - New database schema ❌
 - Different storage system ❌
 
 **Actually needed**:
+
 - Automation scripts ✅
 - Error handling/retry logic ✅
 - Quality validation ✅
@@ -679,7 +710,7 @@ mongodump --db explainshell --archive=dump.gz --gzip
 4. **Create download scripts**
    - Automate package fetching
    - Extract man pages automatically
-   
+
 5. **Test regeneration**
    - Try with Ubuntu Noble
    - Document failures
@@ -725,6 +756,7 @@ mongodump --db explainshell --archive=dump.gz --gzip
 **The manpage system in explainshell is well-designed and functional.**
 
 The "unsustainable" problem is not technical - it's **operational**:
+
 - Manual work is tedious
 - No automation infrastructure
 - Single point of knowledge
@@ -736,7 +768,7 @@ The "unsustainable" problem is not technical - it's **operational**:
 
 ---
 
-*Document created: October 26, 2025*  
-*Based on: Code inspection of explainshell repository*  
-*Author: GitHub Copilot + Tobias Hochgürtel*  
-*Status: Complete - Ready for implementation planning*
+- *Document created: October 26, 2025*
+- *Based on: Code inspection of explainshell repository*
+- *Author: GitHub Copilot + Tobias Hochgürtel*
+- *Status: Complete - Ready for implementation planning*
