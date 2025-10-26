@@ -161,4 +161,4 @@ Same as the original project (GPL-3.0)
 
 ---
 
-**Note to maintainer**: This is meant to be helpful, not to pressure or criticize. The original project is fantastic! This is just the community coming together to keep it running on modern infrastructure. If you'd like to merge these changes, they're ready. If not, this fork exists for those who need it. Thank you for creating such a useful tool! 🙏
+- **Note to maintainer**: This is meant to be helpful, not to pressure or criticize. The original project is fantastic! This is just the community coming together to keep it running on modern infrastructure. If you'd like to merge these changes, they're ready. If not, this fork exists for those who need it. Thank you for creating such a useful tool! 🙏
