@@ -1,0 +1,1465 @@
+#!/usr/bin/env python3
+"""Evaluate mandoc markdown rendering on a real-manpage corpus.
+
+This is intentionally a review tool, not a golden snapshot test.  It renders a
+corpus with a chosen mandoc binary, saves markdown/HTML/metrics artifacts, and
+compares two runs for structural changes that deserve human inspection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from html import escape as html_escape
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any
+
+_HERE = Path(__file__).resolve()
+REPO_ROOT = _HERE.parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from explainshell import config  # noqa: E402
+from explainshell.extraction.llm.text import (  # noqa: E402
+    clean_mandoc_artifacts,
+    filter_sections,
+)
+from explainshell.web.markdown import render_markdown  # noqa: E402
+from tests.evals._common import (  # noqa: E402
+    _format_delta,
+    _get_metric,
+    _git_metadata,
+    _load_summary,
+    _page_map,
+    _path_stem,
+    _read_corpus,
+    _repo_relative,
+    _write_json,
+)
+
+EVAL_DIR = Path(__file__).resolve().parent
+DEFAULT_CORPUS = EVAL_DIR / "corpus.txt"
+DEFAULT_RUNS_DIR = EVAL_DIR / "runs"
+DEFAULT_DIFF_DIRNAME = "diff-report"
+
+_TAGS = (
+    "a",
+    "b",
+    "blockquote",
+    "br",
+    "code",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "i",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "strong",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+)
+_OPTION_RE = re.compile(r"(?<![\w\\])(?:\\?-{1,2}|\\\[mi\])[-A-Za-z0-9][-_A-Za-z0-9]*")
+_UNESCAPED_STAR_RUN_RE = re.compile(r"(?<!\\)\*+")
+_UNESCAPED_UNDER_RUN_RE = re.compile(r"(?<!\\)_+")
+
+
+_SENSITIVE_CHARS = ("\\", "[", "]", "*", "_", "`", "<", ">")
+
+
+class TagCounter(HTMLParser):
+    """Tiny HTML structural counter using the standard library parser."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: Counter[str] = Counter()
+        self.data_chars = 0
+        self.char_hist: Counter[str] = Counter()
+        self.max_depth = 0
+        self._depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.tags[tag] += 1
+        self._depth += 1
+        self.max_depth = max(self.max_depth, self._depth)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.tags[tag] += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        self._depth = max(self._depth - 1, 0)
+
+    def handle_data(self, data: str) -> None:
+        self.data_chars += len(data)
+        for ch in data:
+            if ch in _SENSITIVE_CHARS:
+                self.char_hist[ch] += 1
+
+
+@dataclass(frozen=True)
+class RenderedPage:
+    path: str
+    stem: str
+    markdown: str
+    html: str
+    metrics: dict[str, Any]
+
+
+def _mandoc_markdown(mandoc_path: str, manpage: Path) -> str:
+    result = subprocess.run(
+        [mandoc_path, "-T", "markdown", str(manpage)],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.strip() or f"mandoc exited {result.returncode}"
+        )
+    if not result.stdout.strip():
+        raise RuntimeError("mandoc produced empty markdown")
+    return result.stdout.rstrip() + "\n"
+
+
+def _line_metrics(markdown: str) -> dict[str, Any]:
+    lines = markdown.splitlines()
+    line_lengths = [len(line) for line in lines]
+    option_counts = [len(_OPTION_RE.findall(line)) for line in lines]
+    return {
+        "line_count": len(lines),
+        "nonblank_line_count": sum(1 for line in lines if line.strip()),
+        "char_count": len(markdown),
+        "max_line_length": max(line_lengths, default=0),
+        "avg_line_length": round(sum(line_lengths) / len(lines), 2) if lines else 0,
+        "giant_lines_500": sum(1 for length in line_lengths if length > 500),
+        "giant_lines_1000": sum(1 for length in line_lengths if length > 1000),
+        "option_like_tokens": sum(option_counts),
+        "max_option_like_tokens_on_line": max(option_counts, default=0),
+        "lines_with_multiple_option_like_tokens": sum(
+            1 for count in option_counts if count >= 2
+        ),
+        "unescaped_star_runs": len(_UNESCAPED_STAR_RUN_RE.findall(markdown)),
+        "unescaped_under_runs": len(_UNESCAPED_UNDER_RUN_RE.findall(markdown)),
+    }
+
+
+def _html_metrics(html: str) -> dict[str, Any]:
+    parser = TagCounter()
+    parser.feed(html)
+    tags = {tag: parser.tags.get(tag, 0) for tag in _TAGS}
+    return {
+        "tags": tags,
+        "data_chars": parser.data_chars,
+        "max_depth": parser.max_depth,
+        "chars": {ch: parser.char_hist.get(ch, 0) for ch in _SENSITIVE_CHARS},
+    }
+
+
+def _filtered_metrics(markdown: str) -> dict[str, Any]:
+    cleaned = clean_mandoc_artifacts(markdown.strip())
+    filtered, removed = filter_sections(cleaned)
+    return {
+        "line_count": len(filtered.splitlines()),
+        "char_count": len(filtered),
+        "removed_sections": removed,
+    }
+
+
+def _metrics(path: str, markdown: str, html: str) -> dict[str, Any]:
+    return {
+        "path": path,
+        "markdown": _line_metrics(markdown),
+        "filtered": _filtered_metrics(markdown),
+        "html": _html_metrics(html),
+    }
+
+
+def _render_page(mandoc_path: str, manpage: Path) -> RenderedPage:
+    rel_path = _repo_relative(manpage)
+    markdown = _mandoc_markdown(mandoc_path, manpage)
+    html = render_markdown(markdown)
+    return RenderedPage(
+        path=rel_path,
+        stem=_path_stem(rel_path),
+        markdown=markdown,
+        html=html,
+        metrics=_metrics(rel_path, markdown, html),
+    )
+
+
+def render_run(args: argparse.Namespace) -> int:
+    mandoc_path = os.path.expanduser(args.mandoc or config.MANDOC_PATH)
+    corpus = [Path(p).expanduser() for p in args.paths]
+    if not corpus:
+        corpus = _read_corpus(Path(args.corpus))
+    corpus = [p if p.is_absolute() else REPO_ROOT / p for p in corpus]
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", args.label).strip("-") or "render"
+    run_dir = Path(args.output or DEFAULT_RUNS_DIR / f"{timestamp}-{label}")
+    for subdir in ("markdown", "html", "metrics"):
+        (run_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+    pages: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for manpage in corpus:
+        rel_path = _repo_relative(manpage)
+        print(f"rendering {rel_path}")
+        if not manpage.is_file():
+            failures.append({"path": rel_path, "error": "file not found"})
+            continue
+        try:
+            page = _render_page(mandoc_path, manpage)
+        except Exception as exc:
+            failures.append({"path": rel_path, "error": str(exc)})
+            continue
+        (run_dir / "markdown" / f"{page.stem}.md").write_text(page.markdown)
+        (run_dir / "html" / f"{page.stem}.html").write_text(page.html)
+        _write_json(run_dir / "metrics" / f"{page.stem}.json", page.metrics)
+        pages.append(
+            {
+                "path": page.path,
+                "stem": page.stem,
+                "metrics": page.metrics,
+            }
+        )
+
+    summary = {
+        "label": args.label,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "mandoc": mandoc_path,
+        "git": _git_metadata(),
+        "corpus": [_repo_relative(path) for path in corpus],
+        "page_count": len(pages),
+        "failure_count": len(failures),
+        "failures": failures,
+        "pages": pages,
+    }
+    _write_json(run_dir / "summary.json", summary)
+    print(f"\nrun directory: {run_dir}")
+    print(f"rendered pages: {len(pages)}")
+    print(f"failures: {len(failures)}")
+    return 1 if failures and args.fail_on_failure else 0
+
+
+def _suspicious_changes(
+    path: str, old: dict[str, Any] | None, new: dict[str, Any] | None
+) -> list[str]:
+    if old is None:
+        return ["page added"]
+    if new is None:
+        return ["page removed"]
+
+    reasons: list[str] = []
+    # All thresholds 0.0: any non-zero delta surfaces the page.  Cheap
+    # structural metrics rarely move by accident, so false positives are
+    # tolerable and small structural improvements are exactly what we want
+    # flagged.
+    checks = {
+        "markdown.max_line_length": 0.0,
+        "markdown.giant_lines_500": 0.0,
+        "markdown.giant_lines_1000": 0.0,
+        "markdown.max_option_like_tokens_on_line": 0.0,
+        "markdown.unescaped_star_runs": 0.0,
+        "markdown.unescaped_under_runs": 0.0,
+        "markdown.char_count": 0.02,
+        "filtered.line_count": 0.0,
+        "html.tags.a": 0.0,
+        "html.tags.blockquote": 0.0,
+        "html.tags.br": 0.0,
+        "html.tags.code": 0.0,
+        "html.tags.em": 0.0,
+        "html.tags.h1": 0.0,
+        "html.tags.h2": 0.0,
+        "html.tags.h3": 0.0,
+        "html.tags.h4": 0.0,
+        "html.tags.h5": 0.0,
+        "html.tags.h6": 0.0,
+        "html.tags.li": 0.0,
+        "html.tags.pre": 0.0,
+        "html.tags.strong": 0.0,
+        "html.tags.tr": 0.0,
+        "html.tags.ul": 0.0,
+        "html.tags.ol": 0.0,
+        "html.tags.p": 0.0,
+        "html.data_chars": 0.02,
+        "html.chars.\\": 0.0,
+        "html.chars.[": 0.0,
+        "html.chars.]": 0.0,
+        "html.chars.*": 0.0,
+        "html.chars._": 0.0,
+        "html.chars.`": 0.0,
+        "html.chars.<": 0.0,
+        "html.chars.>": 0.0,
+    }
+    for key, tolerance in checks.items():
+        before = _get_metric(old, key)
+        after = _get_metric(new, key)
+        delta = after - before
+        if delta == 0:
+            continue
+        if tolerance == 0.0:
+            reasons.append(f"{key}: {before} -> {after} ({delta:+})")
+            continue
+        denominator = max(abs(before), 1)
+        if abs(delta) / denominator > tolerance:
+            reasons.append(f"{key}: {before} -> {after} ({delta:+})")
+
+    old_removed = old["metrics"]["filtered"]["removed_sections"]
+    new_removed = new["metrics"]["filtered"]["removed_sections"]
+    if old_removed != new_removed:
+        reasons.append(
+            f"filtered.removed_sections changed: {old_removed} -> {new_removed}"
+        )
+
+    return reasons
+
+
+def _changed_metric_lines(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    metric_keys = [
+        "markdown.line_count",
+        "markdown.char_count",
+        "markdown.max_line_length",
+        "markdown.giant_lines_500",
+        "markdown.max_option_like_tokens_on_line",
+        "filtered.line_count",
+        "html.data_chars",
+        "html.tags.p",
+        "html.tags.br",
+        "html.tags.li",
+        "html.tags.blockquote",
+        "html.tags.pre",
+        "html.tags.a",
+        "html.tags.code",
+        "html.tags.em",
+        "html.tags.strong",
+        "html.tags.h1",
+        "html.tags.h2",
+        "html.tags.h3",
+        "html.tags.tr",
+    ]
+    changed: list[str] = []
+    for key in metric_keys:
+        before = _get_metric(old, key)
+        after = _get_metric(new, key)
+        if before != after:
+            changed.append(f"- `{key}`: {_format_delta(before, after)}")
+    return changed
+
+
+def _summarize_comparison(
+    base_dir: Path,
+    current_dir: Path,
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    suspicious: dict[str, list[str]],
+    paths: list[str],
+) -> str:
+    base_pages = _page_map(baseline)
+    current_pages = _page_map(current)
+    lines: list[str] = [
+        "# Markdown render comparison",
+        "",
+        f"Baseline: `{base_dir}` (`{baseline['label']}`)",
+        f"Current: `{current_dir}` (`{current['label']}`)",
+        "",
+        "## Summary",
+        "",
+        f"- baseline pages: {len(base_pages)}",
+        f"- current pages: {len(current_pages)}",
+        f"- baseline failures: {baseline['failure_count']}",
+        f"- current failures: {current['failure_count']}",
+        "",
+        "## Suspicious structural changes",
+        "",
+    ]
+
+    if suspicious:
+        for path, reasons in suspicious.items():
+            lines.append(f"### `{path}`")
+            lines.append("")
+            for reason in reasons:
+                lines.append(f"- {reason}")
+            lines.append("")
+    else:
+        lines.append("No suspicious structural changes detected.")
+        lines.append("")
+
+    lines.extend(["## Metric deltas", ""])
+    for path in paths:
+        old = base_pages.get(path)
+        new = current_pages.get(path)
+        if old is None or new is None:
+            continue
+        changed = _changed_metric_lines(old, new)
+        if changed:
+            lines.append(f"### `{path}`")
+            lines.append("")
+            lines.extend(changed)
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _comparison_data(
+    base_dir: Path, current_dir: Path
+) -> tuple[dict[str, Any], dict[str, Any], list[str], dict[str, list[str]]]:
+    baseline = _load_summary(base_dir)
+    current = _load_summary(current_dir)
+    base_pages = _page_map(baseline)
+    current_pages = _page_map(current)
+    paths = sorted(set(base_pages) | set(current_pages))
+    suspicious: dict[str, list[str]] = {}
+    for path in paths:
+        reasons = _suspicious_changes(
+            path, base_pages.get(path), current_pages.get(path)
+        )
+        if reasons:
+            suspicious[path] = reasons
+    return baseline, current, paths, suspicious
+
+
+def compare_runs(args: argparse.Namespace) -> int:
+    base_dir = Path(args.baseline)
+    current_dir = Path(args.current)
+    baseline, current, paths, suspicious = _comparison_data(base_dir, current_dir)
+    report = _summarize_comparison(
+        base_dir, current_dir, baseline, current, suspicious, paths
+    )
+    report_path = current_dir / "comparison.md"
+    report_path.write_text(report)
+    print(report)
+    print(f"comparison report: {report_path}")
+
+    if suspicious and args.fail_on_suspicious:
+        return 1
+    return 0
+
+
+def _artifact_path(run_dir: Path, page: dict[str, Any], kind: str, suffix: str) -> Path:
+    return run_dir / kind / f"{page['stem']}.{suffix}"
+
+
+def _pad_screenshots_to_match(expected: Path, actual: Path) -> None:
+    """Top-pad the shorter screenshot with white pixels so both PNGs share
+    the same dimensions.  Lets the comparison slider clip cleanly without the
+    taller image bleeding past the divider.
+    """
+    from PIL import Image
+
+    with Image.open(expected) as e_img, Image.open(actual) as a_img:
+        target_w = max(e_img.width, a_img.width)
+        target_h = max(e_img.height, a_img.height)
+        for path, img in ((expected, e_img), (actual, a_img)):
+            if img.width == target_w and img.height == target_h:
+                continue
+            canvas = Image.new("RGB", (target_w, target_h), "white")
+            canvas.paste(img.convert("RGB"), (0, 0))
+            canvas.save(path)
+
+
+def _write_review_page(
+    path: Path,
+    *,
+    title: str,
+    source_path: str,
+    label: str,
+    fragment_html: str,
+) -> None:
+    del source_path, label  # diff index already shows path + which side this is
+    path.write_text(
+        f"""<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>{html_escape(title)}</title>
+<style>
+  body {{
+    margin: 0;
+    background: #fff;
+    color: #111;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }}
+  main {{ max-width: 980px; margin: 0 auto; padding: 24px; }}
+  pre, code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+  pre {{ overflow-x: auto; background: #f6f8fa; padding: 12px; border-radius: 4px; }}
+  code {{ background: #f6f8fa; padding: 1px 4px; border-radius: 3px; }}
+  pre code {{ background: none; padding: 0; }}
+  table {{ border-collapse: collapse; }}
+  td, th {{ border: 1px solid #e5e7eb; padding: 4px 8px; }}
+</style>
+</head>
+<body>
+<main>
+{fragment_html}
+</main>
+</body>
+</html>
+"""
+    )
+
+
+_CLIP_HEIGHT = 12000
+
+
+def _screenshot_page(
+    html_path: Path,
+    png_path: Path,
+    *,
+    timeout_ms: int,
+    clip_height: int | None = None,
+) -> None:
+    # Hard ceiling so a stalled npx (e.g. cold install) can't hang the run.
+    subprocess_timeout = max(timeout_ms / 1000 * 3, 60)
+    cmd = [
+        "npx",
+        "playwright",
+        "screenshot",
+        "--browser",
+        "chromium",
+        "--timeout",
+        str(timeout_ms),
+    ]
+    if clip_height is None:
+        cmd += ["--full-page", "--viewport-size=1280,900"]
+    else:
+        # Dropping --full-page makes Playwright capture only the viewport,
+        # giving us a top-clipped screenshot that stays under Chromium's
+        # full-page capture limits.
+        cmd += [f"--viewport-size=1280,{clip_height}"]
+    cmd += [html_path.resolve().as_uri(), str(png_path)]
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=subprocess_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"playwright screenshot timed out after {subprocess_timeout:.0f}s"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            "playwright screenshot failed; run `npx playwright install chromium` "
+            f"if browsers are missing. Details: {detail}"
+        )
+
+
+def _screenshot_with_clip_fallback(
+    html_path: Path, png_path: Path, *, timeout_ms: int
+) -> None:
+    try:
+        _screenshot_page(html_path, png_path, timeout_ms=timeout_ms)
+    except RuntimeError:
+        print(f"    full-page failed, retrying with clip-height {_CLIP_HEIGHT}")
+        _screenshot_page(
+            html_path, png_path, timeout_ms=timeout_ms, clip_height=_CLIP_HEIGHT
+        )
+
+
+def _rel(from_dir: Path, target: Path) -> str:
+    return os.path.relpath(target, from_dir).replace(os.sep, "/")
+
+
+def _write_diff_index(
+    report_dir: Path,
+    *,
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    cards: list[dict[str, Any]],
+) -> None:
+    cards_html: list[str] = []
+    options_html: list[str] = []
+    for index, card in enumerate(cards):
+        reasons = (
+            ", ".join(html_escape(r) for r in card["reasons"]) or "Included by --all"
+        )
+        metric_items = [
+            html_escape(line.removeprefix("- `").replace("`: ", ": "))
+            for line in card["metric_lines"]
+        ]
+        metrics = (
+            "".join(f"<li>{m}</li>" for m in metric_items)
+            or "<li>No tracked metric deltas</li>"
+        )
+        card_id = f"card-{card['stem']}"
+        active_attr = " active" if index == 0 else ""
+        options_html.append(
+            f'<option value="{html_escape(card_id)}">'
+            f"{html_escape(card['path'])}</option>"
+        )
+        cards_html.append(
+            f"""
+<section id=\"{html_escape(card_id)}\" class=\"card{active_attr}\">
+  <h2>{html_escape(card["path"])}</h2>
+  <div class=\"meta\">
+    <p><b>Why flagged:</b> {reasons}</p>
+    <details><summary>Metric deltas</summary><ul>{metrics}</ul></details>
+  </div>
+  <nav class=\"tabs\" role=\"tablist\">
+    <button data-mode=\"slider\" aria-selected=\"true\">Slider</button>
+    <button data-mode=\"side-by-side\">Side by side</button>
+    <button data-mode=\"actual\">Actual</button>
+    <button data-mode=\"expected\">Expected</button>
+  </nav>
+  <div class=\"view view-slider active\">
+    <img-comparison-slider hover=\"false\" tabindex=\"0\">
+      <img slot=\"first\" src=\"{html_escape(card["expected_png"])}\" alt=\"Expected screenshot\">
+      <img slot=\"second\" src=\"{html_escape(card["actual_png"])}\" alt=\"Actual screenshot\">
+    </img-comparison-slider>
+  </div>
+  <div class=\"view view-side-by-side\">
+    <div><div class=\"side-label\">expected</div><img src=\"{html_escape(card["expected_png"])}\" alt=\"Expected screenshot\"></div>
+    <div><div class=\"side-label\">actual</div><img src=\"{html_escape(card["actual_png"])}\" alt=\"Actual screenshot\"></div>
+  </div>
+  <div class=\"view view-actual\"><img src=\"{html_escape(card["actual_png"])}\" alt=\"Actual screenshot\"></div>
+  <div class=\"view view-expected\"><img src=\"{html_escape(card["expected_png"])}\" alt=\"Expected screenshot\"></div>
+  <p class=\"links\">
+    <a href=\"{html_escape(card["expected_html"])}\">expected HTML</a>
+    <a href=\"{html_escape(card["actual_html"])}\">actual HTML</a>
+    <a href=\"{html_escape(card["expected_md"])}\">expected markdown</a>
+    <a href=\"{html_escape(card["actual_md"])}\">actual markdown</a>
+  </p>
+</section>
+"""
+        )
+
+    report_dir.joinpath("index.html").write_text(
+        f"""<!doctype html>
+<html lang=\"en\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>Mandoc markdown render diff</title>
+<link rel=\"stylesheet\" href=\"https://unpkg.com/img-comparison-slider@8/dist/styles.css\">
+<script defer src=\"https://unpkg.com/img-comparison-slider@8/dist/index.js\"></script>
+<style>
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  background: #fff;
+  color: #111;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}}
+header {{
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 24px;
+  border-bottom: 1px solid #e5e7eb;
+  flex-wrap: wrap;
+}}
+header h1 {{ margin: 0; font-size: 16px; font-weight: 600; }}
+.summary {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.pill {{
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  border-radius: 4px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: #555;
+}}
+.pill b {{ color: #111; font-weight: 600; }}
+main {{ max-width: 1320px; margin: 0 auto; padding: 24px 24px 64px; }}
+#page-select {{
+  font: inherit;
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 4px;
+  background: #fff;
+  max-width: 100%;
+  flex: 1 1 320px;
+  min-width: 0;
+}}
+.card {{ display: none; margin-bottom: 0; }}
+.card.active {{ display: block; }}
+.empty {{ color: #555; }}
+.card h2 {{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 0 0 6px;
+  word-break: break-all;
+  color: #111;
+}}
+.meta {{ font-size: 13px; color: #444; margin-bottom: 12px; }}
+.meta p {{ margin: 2px 0; }}
+.meta details {{ margin-top: 4px; }}
+.meta summary {{ cursor: pointer; color: #555; }}
+.meta ul {{ margin: 4px 0 0; padding-left: 20px; color: #555; }}
+.tabs {{
+  display: flex;
+  border-bottom: 1px solid #e5e7eb;
+  margin-bottom: 12px;
+}}
+.tabs button {{
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #555;
+  cursor: pointer;
+}}
+.tabs button[aria-selected="true"] {{
+  color: #111;
+  border-bottom-color: #111;
+}}
+.view {{ display: none; }}
+.view.active {{ display: block; }}
+.view img {{ display: block; width: 100%; height: auto; border: 1px solid #e5e7eb; }}
+.view-side-by-side.active {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+.side-label {{ font-size: 12px; color: #555; margin-bottom: 4px; }}
+img-comparison-slider {{
+  display: block;
+  width: 100%;
+  border: 1px solid #e5e7eb;
+  --divider-color: #2563eb;
+  --divider-width: 2px;
+  --default-handle-color: #2563eb;
+}}
+img-comparison-slider img {{ display: block; width: 100%; height: auto; }}
+.links {{ font-size: 13px; margin: 12px 0 0; }}
+.links a {{ color: #2563eb; margin-right: 16px; text-decoration: none; }}
+.links a:hover {{ text-decoration: underline; }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Render diff</h1>
+  <div class=\"summary\">
+    <span class=\"pill\">expected <b>{html_escape(baseline["label"])}</b></span>
+    <span class=\"pill\">actual <b>{html_escape(current["label"])}</b></span>
+  </div>
+  {"<select id='page-select' aria-label='Select page'>" + "".join(options_html) + "</select>" if cards else ""}
+  {f'<span class="pill"><span id="page-pos">1</span> / {len(cards)}</span>' if cards else ""}
+</header>
+<main>
+{"".join(cards_html) if cards_html else "<p class='empty'>No pages selected for screenshot diff.</p>"}
+</main>
+<script>
+document.addEventListener("click", e => {{
+  const btn = e.target.closest(".tabs button");
+  if (!btn) return;
+  const card = btn.closest(".card");
+  const mode = btn.dataset.mode;
+  card.querySelectorAll(".tabs button").forEach(b =>
+    b.setAttribute("aria-selected", b === btn ? "true" : "false"));
+  card.querySelectorAll(".view").forEach(v =>
+    v.classList.toggle("active", v.classList.contains("view-" + mode)));
+}});
+
+const select = document.getElementById("page-select");
+const pos = document.getElementById("page-pos");
+function showCard(id, {{ updateHash = true }} = {{}}) {{
+  const card = id && document.getElementById(id);
+  if (!card) return false;
+  document.querySelectorAll(".card").forEach(c =>
+    c.classList.toggle("active", c === card));
+  if (select) select.value = id;
+  if (pos) pos.textContent = String(select.selectedIndex + 1);
+  if (updateHash && location.hash.slice(1) !== id) {{
+    history.replaceState(null, "", "#" + id);
+  }}
+  return true;
+}}
+if (select) {{
+  select.addEventListener("change", () => showCard(select.value));
+  const initial = location.hash.slice(1);
+  if (!initial || !showCard(initial, {{ updateHash: false }})) {{
+    showCard(select.value, {{ updateHash: false }});
+  }}
+  window.addEventListener("hashchange", () =>
+    showCard(location.hash.slice(1) || select.options[0].value, {{ updateHash: false }}));
+}}
+</script>
+</body>
+</html>
+"""
+    )
+
+
+def diff_report(args: argparse.Namespace) -> int:
+    base_dir = Path(args.baseline)
+    current_dir = Path(args.current)
+    baseline, current, paths, suspicious = _comparison_data(base_dir, current_dir)
+    base_pages = _page_map(baseline)
+    current_pages = _page_map(current)
+    report_dir = Path(args.output or current_dir / DEFAULT_DIFF_DIRNAME)
+    pages_dir = report_dir / "pages"
+    shots_dir = report_dir / "screenshots"
+    pages_dir.mkdir(parents=True, exist_ok=True)
+    shots_dir.mkdir(parents=True, exist_ok=True)
+
+    selected = paths if args.all else list(suspicious)
+    if args.limit is not None:
+        selected = selected[: args.limit]
+
+    cards: list[dict[str, Any]] = []
+    for path in selected:
+        old = base_pages.get(path)
+        new = current_pages.get(path)
+        if old is None or new is None:
+            side = "baseline" if new is None else "current"
+            print(f"skipping {path}: only present in {side}")
+            continue
+        stem = new["stem"]
+        expected_fragment = _artifact_path(base_dir, old, "html", "html").read_text()
+        actual_fragment = _artifact_path(current_dir, new, "html", "html").read_text()
+        expected_page = pages_dir / f"{stem}-expected.html"
+        actual_page = pages_dir / f"{stem}-actual.html"
+        expected_png = shots_dir / f"{stem}-expected.png"
+        actual_png = shots_dir / f"{stem}-actual.png"
+        _write_review_page(
+            expected_page,
+            title=f"expected: {path}",
+            source_path=path,
+            label=f"expected / {baseline['label']}",
+            fragment_html=expected_fragment,
+        )
+        _write_review_page(
+            actual_page,
+            title=f"actual: {path}",
+            source_path=path,
+            label=f"actual / {current['label']}",
+            fragment_html=actual_fragment,
+        )
+        try:
+            print(f"screenshot {path} expected")
+            _screenshot_with_clip_fallback(
+                expected_page, expected_png, timeout_ms=args.timeout
+            )
+            print(f"screenshot {path} actual")
+            _screenshot_with_clip_fallback(
+                actual_page, actual_png, timeout_ms=args.timeout
+            )
+        except RuntimeError as exc:
+            print(f"  ! skipping {path}: {exc}")
+            continue
+        _pad_screenshots_to_match(expected_png, actual_png)
+        cards.append(
+            {
+                "path": path,
+                "stem": stem,
+                "reasons": suspicious.get(path, []),
+                "metric_lines": _changed_metric_lines(old, new),
+                "expected_png": _rel(report_dir, expected_png),
+                "actual_png": _rel(report_dir, actual_png),
+                "expected_html": _rel(report_dir, expected_page),
+                "actual_html": _rel(report_dir, actual_page),
+                "expected_md": _rel(
+                    report_dir, _artifact_path(base_dir, old, "markdown", "md")
+                ),
+                "actual_md": _rel(
+                    report_dir, _artifact_path(current_dir, new, "markdown", "md")
+                ),
+            }
+        )
+
+    comparison = _summarize_comparison(
+        base_dir, current_dir, baseline, current, suspicious, paths
+    )
+    (report_dir / "comparison.md").write_text(comparison)
+    _write_diff_index(report_dir, baseline=baseline, current=current, cards=cards)
+    print(f"diff report: {report_dir / 'index.html'}")
+    return 0
+
+
+_AUDIT_TAG_STRIP_RE = re.compile(r"<[^>]+>")
+_AUDIT_QUAD_STAR_RE = re.compile(r"(?<!\\)\*{4,}")
+_AUDIT_EMPTY_EMPHASIS_RE = re.compile(r"<(em|strong)\b[^>]*>\s*</\1>")
+_AUDIT_ROFF_NAMED_ESCAPE_RE = re.compile(r"\\\[([A-Za-z0-9_-]+)\]")
+_AUDIT_ROFF_TWO_LETTER_ESCAPE_RE = re.compile(r"\\\(([A-Za-z0-9]{2})")
+_AUDIT_ROFF_FONT_ESCAPE_RE = re.compile(r"\\f[BIRP]\b")
+_AUDIT_VISIBLE_ZWNJ_RE = re.compile(r"&zwnj;")
+_AUDIT_VISIBLE_NBSP_RE = re.compile(r"&nbsp;")
+_AUDIT_VISIBLE_DOUBLE_AMP_RE = re.compile(r"&amp;amp;")
+_AUDIT_OPEN_DOUBLE_BACKTICK_RE = re.compile(r"\\`\\`")
+_AUDIT_SYNOPSIS_HEADING_RE = re.compile(r"^#+\s+SYNOPSIS\s*$", re.IGNORECASE)
+_AUDIT_WHITESPACE_RE = re.compile(r"\s")
+_AUDIT_UNICODE_ESCAPE_RE = re.compile(r"^u[0-9A-Fa-f]{4,6}$")
+
+# Canonical mandoc named escapes from mandoc_char(7) — the union of the
+# two-letter `\(xx` forms and the bracketed `\[name]` forms.  A bracket-form
+# match like `\[bfrnt]` whose name is NOT in this set is authored content
+# (lsof.8 documents the C `\[bfrnt]` shorthand), not a leaked escape, so we
+# skip it.  Keeps the rule false-positive-free at Tier 1.
+KNOWN_MANDOC_ESCAPE_NAMES = frozenset(
+    {
+        "12",
+        "14",
+        "18",
+        "34",
+        "38",
+        "3d",
+        "58",
+        "78",
+        "AE",
+        "AN",
+        "Ah",
+        "Bq",
+        "CL",
+        "CR",
+        "Cs",
+        "DI",
+        "Do",
+        "Eu",
+        "Fc",
+        "Fi",
+        "Fl",
+        "Fn",
+        "Fo",
+        "HE",
+        "IJ",
+        "Im",
+        "N",
+        "OE",
+        "OK",
+        "OR",
+        "Of",
+        "Om",
+        "Po",
+        "Re",
+        "S1",
+        "S2",
+        "S3",
+        "SP",
+        "TP",
+        "Tp",
+        "XX",
+        "Ye",
+        "aa",
+        "ab",
+        "ac",
+        "ad",
+        "ae",
+        "ah",
+        "an",
+        "ao",
+        "ap",
+        "aq",
+        "at",
+        "ba",
+        "bb",
+        "bq",
+        "br",
+        "bu",
+        "bv",
+        "ca",
+        "char34",
+        "ci",
+        "co",
+        "coproduct",
+        "cq",
+        "ct",
+        "cu",
+        "dA",
+        "da",
+        "dd",
+        "de",
+        "dg",
+        "di",
+        "dq",
+        "em",
+        "en",
+        "eq",
+        "es",
+        "eu",
+        "fa",
+        "fc",
+        "ff",
+        "fi",
+        "fl",
+        "fm",
+        "fo",
+        "ga",
+        "gr",
+        "hA",
+        "ha",
+        "hbar",
+        "ho",
+        "hy",
+        "ib",
+        "if",
+        "ij",
+        "integral",
+        "ip",
+        "is",
+        "lA",
+        "lB",
+        "lC",
+        "la",
+        "lb",
+        "lc",
+        "lf",
+        "lh",
+        "lk",
+        "lq",
+        "lt",
+        "lz",
+        "mc",
+        "mi",
+        "mo",
+        "mu",
+        "nb",
+        "nc",
+        "ne",
+        "nm",
+        "no",
+        "oA",
+        "oa",
+        "oe",
+        "or",
+        "oq",
+        "pc",
+        "pd",
+        "pl",
+        "pp",
+        "product",
+        "ps",
+        "pt",
+        "rA",
+        "rB",
+        "rC",
+        "ra",
+        "rb",
+        "rc",
+        "rf",
+        "rg",
+        "rh",
+        "rk",
+        "rn",
+        "rq",
+        "rs",
+        "rt",
+        "ru",
+        "sb",
+        "sc",
+        "sd",
+        "Sd",
+        "sh",
+        "sl",
+        "sp",
+        "sq",
+        "sqrt",
+        "sqrtex",
+        "sr",
+        "ss",
+        "st",
+        "sum",
+        "tdi",
+        "te",
+        "tf",
+        "ti",
+        "tm",
+        "tmu",
+        "tno",
+        "ts",
+        "uA",
+        "ua",
+        "ul",
+        "vA",
+        "va",
+        "wp",
+        "braceex",
+        "braceleftbt",
+        "braceleftex",
+        "braceleftmid",
+        "bracelefttp",
+        "bracerightbt",
+        "bracerightex",
+        "bracerightmid",
+        "bracerighttp",
+        "bracketleftbt",
+        "bracketleftex",
+        "bracketlefttp",
+        "bracketrightbt",
+        "bracketrightex",
+        "bracketrighttp",
+        "parenleftbt",
+        "parenleftex",
+        "parenlefttp",
+        "parenrightbt",
+        "parenrightex",
+        "parenrighttp",
+        "radicalex",
+    }
+)
+
+
+def _audit_is_known_escape_name(name: str) -> bool:
+    return (
+        name in KNOWN_MANDOC_ESCAPE_NAMES
+        or _AUDIT_UNICODE_ESCAPE_RE.match(name) is not None
+    )
+
+
+AuditScanner = Callable[[str, str], list[tuple[int, str]]]
+
+
+def _audit_strip_tags(html: str) -> str:
+    return _AUDIT_TAG_STRIP_RE.sub("", html)
+
+
+def _audit_snippet(line: str, start: int, end: int, pad: int = 12) -> str:
+    return line[max(0, start - pad) : min(len(line), end + pad)]
+
+
+def _audit_scan_quad_star(markdown: str, html: str) -> list[tuple[int, str]]:
+    hits: list[tuple[int, str]] = []
+    for line_no, line in enumerate(markdown.splitlines(), 1):
+        for match in _AUDIT_QUAD_STAR_RE.finditer(line):
+            hits.append((line_no, _audit_snippet(line, match.start(), match.end())))
+    return hits
+
+
+def _audit_scan_empty_emphasis(markdown: str, html: str) -> list[tuple[int, str]]:
+    return [
+        (match.start(), match.group(0))
+        for match in _AUDIT_EMPTY_EMPHASIS_RE.finditer(html)
+    ]
+
+
+def _audit_scan_roff_named(markdown: str, html: str) -> list[tuple[int, str]]:
+    text = _audit_strip_tags(html)
+    return [
+        (match.start(), match.group(0))
+        for match in _AUDIT_ROFF_NAMED_ESCAPE_RE.finditer(text)
+        if _audit_is_known_escape_name(match.group(1))
+    ]
+
+
+def _audit_scan_roff_two_letter(markdown: str, html: str) -> list[tuple[int, str]]:
+    text = _audit_strip_tags(html)
+    return [
+        (match.start(), match.group(0))
+        for match in _AUDIT_ROFF_TWO_LETTER_ESCAPE_RE.finditer(text)
+        if _audit_is_known_escape_name(match.group(1))
+    ]
+
+
+def _audit_scan_roff_font(markdown: str, html: str) -> list[tuple[int, str]]:
+    text = _audit_strip_tags(html)
+    return [
+        (match.start(), match.group(0))
+        for match in _AUDIT_ROFF_FONT_ESCAPE_RE.finditer(text)
+    ]
+
+
+def _audit_scan_visible_zwnj(markdown: str, html: str) -> list[tuple[int, str]]:
+    text = _audit_strip_tags(html)
+    return [
+        (match.start(), match.group(0))
+        for match in _AUDIT_VISIBLE_ZWNJ_RE.finditer(text)
+    ]
+
+
+def _audit_scan_visible_nbsp(markdown: str, html: str) -> list[tuple[int, str]]:
+    text = _audit_strip_tags(html)
+    return [
+        (match.start(), match.group(0))
+        for match in _AUDIT_VISIBLE_NBSP_RE.finditer(text)
+    ]
+
+
+def _audit_scan_visible_double_amp(markdown: str, html: str) -> list[tuple[int, str]]:
+    text = _audit_strip_tags(html)
+    return [
+        (match.start(), match.group(0))
+        for match in _AUDIT_VISIBLE_DOUBLE_AMP_RE.finditer(text)
+    ]
+
+
+def _audit_scan_open_double_backtick(markdown: str, html: str) -> list[tuple[int, str]]:
+    hits: list[tuple[int, str]] = []
+    for line_no, line in enumerate(markdown.splitlines(), 1):
+        for match in _AUDIT_OPEN_DOUBLE_BACKTICK_RE.finditer(line):
+            hits.append((line_no, _audit_snippet(line, match.start(), match.end())))
+    return hits
+
+
+def _audit_scan_giant_markdown_line(markdown: str, html: str) -> list[tuple[int, str]]:
+    hits: list[tuple[int, str]] = []
+    for line_no, line in enumerate(markdown.splitlines(), 1):
+        if len(line) > 2000:
+            hits.append((line_no, line[:80] + "..."))
+    return hits
+
+
+def _audit_scan_synopsis_no_spaces_run(
+    markdown: str, html: str
+) -> list[tuple[int, str]]:
+    hits: list[tuple[int, str]] = []
+    in_synopsis = False
+    for line_no, line in enumerate(markdown.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            in_synopsis = bool(_AUDIT_SYNOPSIS_HEADING_RE.match(stripped))
+            continue
+        if in_synopsis and len(line) > 200 and not _AUDIT_WHITESPACE_RE.search(line):
+            hits.append((line_no, line[:80] + "..."))
+    return hits
+
+
+AUDIT_RULES: list[tuple[str, AuditScanner, str]] = [
+    (
+        "quad_star_run",
+        _audit_scan_quad_star,
+        "runs of 4+ stars (e.g. `**foo****bar**`)",
+    ),
+    (
+        "empty_emphasis_tag",
+        _audit_scan_empty_emphasis,
+        "empty <em>/<strong> tags",
+    ),
+    (
+        "roff_named_escape",
+        _audit_scan_roff_named,
+        r"`\[name]` form leaking into output",
+    ),
+    (
+        "roff_two_letter_escape",
+        _audit_scan_roff_two_letter,
+        r"`\(xx` form leaking into output",
+    ),
+    (
+        "roff_font_escape",
+        _audit_scan_roff_font,
+        r"`\fX` font escape leaking into output",
+    ),
+    (
+        "visible_zwnj_entity",
+        _audit_scan_visible_zwnj,
+        "literal &zwnj; entity in text",
+    ),
+    (
+        "visible_nbsp_entity",
+        _audit_scan_visible_nbsp,
+        "literal &nbsp; entity in text",
+    ),
+    (
+        "visible_double_amp",
+        _audit_scan_visible_double_amp,
+        "double-encoded ampersand &amp;amp;",
+    ),
+    (
+        "visible_open_double_backtick",
+        _audit_scan_open_double_backtick,
+        r"literal `\`\`` in markdown (asymmetric typographic open quote)",
+    ),
+    (
+        "giant_markdown_line",
+        _audit_scan_giant_markdown_line,
+        "markdown line > 2000 chars",
+    ),
+    (
+        "synopsis_no_spaces_run",
+        _audit_scan_synopsis_no_spaces_run,
+        "synopsis line > 200 chars with no whitespace",
+    ),
+]
+
+
+def _select_audit_rules(rules_csv: str | None) -> list[tuple[str, AuditScanner, str]]:
+    if not rules_csv:
+        return list(AUDIT_RULES)
+    selected = {token.strip() for token in rules_csv.split(",") if token.strip()}
+    known = {rule_id for rule_id, _, _ in AUDIT_RULES}
+    unknown = selected - known
+    if unknown:
+        raise SystemExit(f"unknown rule_id(s): {', '.join(sorted(unknown))}")
+    return [rule for rule in AUDIT_RULES if rule[0] in selected]
+
+
+def _scan_audit_run(
+    run_dir: Path,
+    summary: dict[str, Any],
+    rules: list[tuple[str, AuditScanner, str]],
+) -> dict[str, list[tuple[str, int, list[str]]]]:
+    results: dict[str, list[tuple[str, int, list[str]]]] = {
+        rule_id: [] for rule_id, _, _ in rules
+    }
+    for page in summary["pages"]:
+        stem = page["stem"]
+        md_path = run_dir / "markdown" / f"{stem}.md"
+        html_path = run_dir / "html" / f"{stem}.html"
+        if not md_path.is_file() or not html_path.is_file():
+            continue
+        markdown = md_path.read_text()
+        html = html_path.read_text()
+        for rule_id, scanner, _ in rules:
+            hits = scanner(markdown, html)
+            if hits:
+                examples = [snippet for _, snippet in hits[:3]]
+                results[rule_id].append((page["path"], len(hits), examples))
+    return results
+
+
+def _print_audit_report(
+    run_dir: Path,
+    summary: dict[str, Any],
+    rules: list[tuple[str, AuditScanner, str]],
+    violations: dict[str, list[tuple[str, int, list[str]]]],
+) -> None:
+    print(f"audit: {run_dir}")
+    print(f"pages scanned: {summary.get('page_count', len(summary.get('pages', [])))}")
+    print()
+
+    rules_with_violations = 0
+    total_occurrences = 0
+    page_cap = 10
+    for rule_id, _, _ in rules:
+        per_page = violations[rule_id]
+        if not per_page:
+            print(f"{rule_id}: ✓ none")
+            print()
+            continue
+        rules_with_violations += 1
+        total_pages = len(per_page)
+        total_hits = sum(count for _, count, _ in per_page)
+        total_occurrences += total_hits
+        print(f"{rule_id}: {total_pages} pages, {total_hits} occurrences")
+        per_page_sorted = sorted(per_page, key=lambda item: (-item[1], item[0]))
+        for path, count, _ in per_page_sorted[:page_cap]:
+            print(f"  {path:40s}  {count}")
+        if len(per_page_sorted) > page_cap:
+            print(f"  ... +{len(per_page_sorted) - page_cap} pages")
+        first_example = next(
+            (example for _, _, examples in per_page_sorted for example in examples),
+            None,
+        )
+        if first_example:
+            print(f"  example: {first_example!r}")
+        print()
+
+    print(
+        f"summary: {rules_with_violations} of {len(rules)} rules with violations "
+        f"({total_occurrences} total occurrences)"
+    )
+
+
+def audit_run(args: argparse.Namespace) -> int:
+    run_dir = Path(args.run).resolve()
+    summary = _load_summary(run_dir)
+    rules = _select_audit_rules(args.rules)
+    violations = _scan_audit_run(run_dir, summary, rules)
+    _print_audit_report(run_dir, summary, rules, violations)
+    if args.fail_on_violation and any(violations[rule_id] for rule_id, _, _ in rules):
+        return 1
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    render_p = subparsers.add_parser("render", help="render corpus artifacts")
+    render_p.add_argument("paths", nargs="*", help="optional manpage paths")
+    render_p.add_argument("--label", required=True, help="human-readable run label")
+    render_p.add_argument(
+        "--mandoc",
+        help=f"mandoc binary (default: MANDOC_PATH/config, currently {config.MANDOC_PATH})",
+    )
+    render_p.add_argument(
+        "--corpus", default=str(DEFAULT_CORPUS), help="corpus file path"
+    )
+    render_p.add_argument("--output", help="run output directory")
+    render_p.add_argument(
+        "--fail-on-failure",
+        action="store_true",
+        help="exit non-zero on render failures",
+    )
+    render_p.set_defaults(func=render_run)
+
+    compare_p = subparsers.add_parser("compare", help="compare two render runs")
+    compare_p.add_argument("baseline", help="baseline run directory")
+    compare_p.add_argument("current", help="current run directory")
+    compare_p.add_argument(
+        "--fail-on-suspicious",
+        action="store_true",
+        help="exit non-zero when suspicious structural changes are detected",
+    )
+    compare_p.set_defaults(func=compare_runs)
+
+    diff_p = subparsers.add_parser(
+        "diff", help="build a Playwright-style screenshot diff report"
+    )
+    diff_p.add_argument("baseline", help="expected/baseline run directory")
+    diff_p.add_argument("current", help="actual/current run directory")
+    diff_p.add_argument("--output", help="diff report output directory")
+    diff_p.add_argument(
+        "--all",
+        action="store_true",
+        help="screenshot all pages instead of only suspicious pages",
+    )
+    diff_p.add_argument(
+        "--limit", type=int, help="maximum number of pages to screenshot"
+    )
+    diff_p.add_argument(
+        "--timeout",
+        type=int,
+        default=30_000,
+        help="Playwright screenshot timeout in milliseconds",
+    )
+    diff_p.set_defaults(func=diff_report)
+
+    audit_p = subparsers.add_parser(
+        "audit",
+        help="audit a render run for absolute (baseline-free) rendering bugs",
+    )
+    audit_p.add_argument("run", help="render run directory to audit")
+    audit_p.add_argument(
+        "--rules",
+        help=(
+            "comma-separated rule ids to apply (default: all). "
+            f"available: {', '.join(rule_id for rule_id, _, _ in AUDIT_RULES)}"
+        ),
+    )
+    audit_p.add_argument(
+        "--fail-on-violation",
+        action="store_true",
+        help="exit non-zero when any rule reports at least one violation",
+    )
+    audit_p.set_defaults(func=audit_run)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

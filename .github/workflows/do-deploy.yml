@@ -1,0 +1,59 @@
+# Deploys to DigitalOcean App Platform. Waits for CI to pass on
+# master, resolves the newest db-latest asset name, renders the app
+# spec with DB_NAME + GIT_SHA, then applies it with a force-rebuild
+# so DO's cached branch head doesn't leave us deploying a stale commit.
+
+name: DO Deploy
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy app
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: do-deploy-group
+      cancel-in-progress: true
+    environment: production
+    steps:
+      - uses: actions/checkout@v6
+      - uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - id: db
+        # Resolve the exact db-latest asset name and pass it through
+        # as a build arg so the image is pinned to what CI captured
+        # (rather than "whatever is newest at remote-build time",
+        # which would race with concurrent uploads).
+        run: |
+          NAME=$(gh api "repos/${{ github.repository }}/releases/tags/db-latest" \
+            --jq '[.assets[] | select(.name | test("^explainshell-.*\\.db\\.zst$"))] | sort_by(.created_at) | last | .name')
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Render app spec
+        env:
+          DB_NAME: ${{ steps.db.outputs.name }}
+          GIT_SHA: ${{ github.sha }}
+          DATADOG_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+        run: envsubst < prod/digitalocean/app.yaml > /tmp/app.yaml
+      - name: Apply app spec and deploy
+        # `apps update --spec` alone triggers a deploy, but with
+        # deploy_on_push=false DO never sees push webhooks, so its
+        # cached commit pointer for the branch doesn't advance and the
+        # deploy builds from a stale commit. `create-deployment
+        # --force-rebuild` refetches the branch head and supersedes
+        # the stale in-progress deploy. Net effect: the spec (with
+        # fresh DB_NAME/GIT_SHA build args) lands, and the deploy
+        # builds from the commit we actually want.
+        run: |
+          doctl apps update ${{ secrets.DO_APP_ID }} --spec /tmp/app.yaml
+          doctl apps create-deployment ${{ secrets.DO_APP_ID }} --force-rebuild --wait

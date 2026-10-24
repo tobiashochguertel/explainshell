@@ -1,43 +1,309 @@
-import logging, itertools, urllib
-import markupsafe
-
-from flask import render_template, request, redirect
+import itertools
+import logging
+import os
+import urllib
 
 import bashlex.errors
+import markupsafe
+from flask import (
+    Blueprint,
+    current_app,
+    make_response,
+    redirect,
+    render_template,
+    request,
+)
 
-from explainshell import matcher, errors, util, store, config
-from explainshell.web import app, helpers
+from explainshell import config, errors, matcher, util
+from explainshell.web import get_distros, get_store, helpers
+from explainshell.web.markdown import render_markdown
 
 logger = logging.getLogger(__name__)
 
+bp = Blueprint("main", __name__)
 
-@app.route("/")
+
+def _is_known_distro(name):
+    """Return True if *name* matches a distro in the cached distros list."""
+    for distro, _release in get_distros():
+        if distro == name:
+            return True
+    return False
+
+
+def _is_known_distro_release(distro: str, release: str) -> bool:
+    """Return True if *distro*/*release* is a pair in the cached distros list.
+
+    URL path segments reach `_explain_prefix`, so a release is only bound
+    from the URL once it is known to name a real release.
+    """
+    for known_distro, known_release in get_distros():
+        if known_distro == distro and known_release == release:
+            return True
+    return False
+
+
+def _explain_prefix(distro, release):
+    """Return the URL prefix for explain routes, with or without distro."""
+    if distro and release:
+        return f"/explain/{distro}/{release}"
+    return "/explain"
+
+
+def _get_distro_release(url_distro=None, url_release=None):
+    """Resolve distro/release: URL params > default."""
+    if url_distro and url_release:
+        return url_distro, url_release
+    pairs = list(get_distros())
+    if pairs:
+        pairs.sort(key=lambda dr: (dr[0] == "ubuntu", dr[1]), reverse=True)
+        return pairs[0]
+    return None, None
+
+
+def _get_current_url_distro_release():
+    """Parse the current request path for distro/release segments.
+
+    Returns (distro, release) if the path starts with /explain/<distro>/<release>/...,
+    otherwise (None, None).
+    """
+    path = request.path
+    if not path.startswith("/explain/"):
+        return None, None
+    rest = path[len("/explain/") :]
+    parts = rest.split("/")
+    if len(parts) >= 2 and _is_known_distro_release(parts[0], parts[1]):
+        return parts[0], parts[1]
+    return None, None
+
+
+@bp.app_context_processor
+def inject_distros():
+    url_distro, url_release = _get_current_url_distro_release()
+    active_distro, active_release = _get_distro_release(url_distro, url_release)
+    prefix = _explain_prefix(url_distro, url_release)
+    # Suffix to append after /explain/<distro>/<release> when switching
+    # distros.  Preserves the path tail (e.g. /1/tar) and query string
+    # (e.g. ?cmd=tar+xzvf) from the current request.
+    suffix = request.path[len(prefix) :]
+    qs = request.query_string.decode()
+    if qs:
+        suffix += "?" + qs
+    return {
+        "available_distros": get_distros(),
+        "explain_prefix": prefix,
+        "distro_switch_suffix": suffix,
+        "active_distro": active_distro,
+        "active_release": active_release,
+    }
+
+
+@bp.route("/")
 def index():
-    return render_template("index.html")
+    not_modified = _not_modified_if_fresh()
+    if not_modified is not None:
+        return not_modified
+    return _cacheable_explain_response(render_template("index.html"))
 
 
-@app.route("/about")
-def about():
-    return render_template("about.html")
+debug_bp = Blueprint("manpage", __name__)
 
 
-@app.route("/explain")
-def explain():
-    if "cmd" not in request.args or not request.args["cmd"].strip():
+@debug_bp.route("/manpage/<distro>/")
+def manpage_releases(distro):
+    """List available releases for a distro."""
+    releases = sorted(release for d, release in get_distros() if d == distro)
+    return render_template(
+        "manpage_releases.html",
+        distro=distro,
+        releases=releases,
+    )
+
+
+@debug_bp.route("/manpage/<distro>/<release>/")
+def manpage_sections(distro, release):
+    """List available sections for a distro/release."""
+    sections = get_store().list_sections(distro, release)
+    return render_template(
+        "manpage_sections.html",
+        distro=distro,
+        release=release,
+        sections=sections,
+    )
+
+
+@debug_bp.route("/manpage/<distro>/<release>/<section>/")
+def manpage_list(distro, release, section):
+    """List available manpages within a section."""
+    prefix = f"{distro}/{release}/{section}/"
+    sources = get_store().list_manpages(prefix)
+    entries = []
+    for source in sorted(sources):
+        # source is e.g. "ubuntu/26.04/1/cd.1posix.gz"; strip the
+        # distro/release prefix and .gz suffix to form the URL tail.
+        tail = source[len(f"{distro}/{release}/") : -3]  # "1/cd.1posix"
+        basename = os.path.basename(source)[:-3]
+        name, sec = util.name_section(basename)
+        entries.append(
+            {
+                "name": name,
+                "section": sec,
+                "url": f"/manpage/{distro}/{release}/{urllib.parse.quote(tail)}",
+            }
+        )
+
+    return render_template(
+        "manpage_list.html",
+        distro=distro,
+        release=release,
+        section=section,
+        entries=entries,
+    )
+
+
+@debug_bp.route("/manpage/<distro>/<release>/<path:rest>")
+def manpage(distro, release, rest):
+    """Serve the raw manpage source text via exact lookup.
+
+    *rest* is everything after distro/release, e.g. "1/cd.1posix",
+    mapping to source key "ubuntu/26.04/1/cd.1posix.gz".
+    """
+    source = f"{distro}/{release}/{rest}.gz"
+    raw = get_store().get_raw_manpage(source)
+    if raw is None:
+        return render_template(
+            "errors/missingmanpage.html",
+            title="missing man page",
+            e=errors.ProgramDoesNotExist(rest),
+        )
+
+    is_markdown = "markdown" in raw.generator
+    name, sec = util.name_section(os.path.basename(source)[:-3])
+    return render_template(
+        "manpage.html",
+        program=f"{name}({sec})",
+        source_text=raw.source_text,
+        source_html=render_markdown(raw.source_text) if is_markdown else None,
+        is_markdown=is_markdown,
+    )
+
+
+@bp.route("/explain", defaults={"path": ""})
+@bp.route("/explain/<path:path>")
+def explain_router(path):
+    """Unified router that handles all /explain/* URLs.
+
+    Path disambiguation:
+    - With ?cmd=: 0 segments = no distro, 2 segments = distro/release
+    - Without ?cmd=: 1=program, 2=section/program, 3=distro/release/program,
+      4=distro/release/section/program
+
+    A distro/release pair is only accepted when it names a real release;
+    anything else redirects to the index rather than being bound into the
+    URLs the page builds.
+    """
+    parts = [p for p in path.split("/") if p] if path else []
+    has_cmd = "cmd" in request.args
+
+    url_distro = None
+    url_release = None
+    section = None
+    program = None
+
+    if has_cmd:
+        if len(parts) == 0:
+            pass  # no distro
+        elif len(parts) == 2 and _is_known_distro_release(parts[0], parts[1]):
+            url_distro, url_release = parts[0], parts[1]
+        else:
+            # invalid path with ?cmd
+            return redirect("/")
+    else:
+        if len(parts) == 0:
+            return redirect("/")
+        elif len(parts) == 1:
+            program = parts[0]
+        elif len(parts) == 2:
+            # distro-vs-section disambiguation only; no release is bound here,
+            # so an unknown release (/explain/ubuntu/bogus) still redirects to
+            # the index rather than being read as section "ubuntu"
+            if _is_known_distro(parts[0]):
+                # /explain/ubuntu/26.04 with no ?cmd → redirect to index
+                return redirect("/")
+            section, program = parts[0], parts[1]
+        elif len(parts) == 3 and _is_known_distro_release(parts[0], parts[1]):
+            url_distro, url_release, program = parts[0], parts[1], parts[2]
+        elif len(parts) == 4 and _is_known_distro_release(parts[0], parts[1]):
+            url_distro, url_release, section, program = (
+                parts[0],
+                parts[1],
+                parts[2],
+                parts[3],
+            )
+        else:
+            return redirect("/")
+
+    if has_cmd:
+        return _handle_explain_cmd(url_distro, url_release)
+    else:
+        return _handle_explain_program(section, program, url_distro, url_release)
+
+
+def _handle_explain_cmd(url_distro, url_release):
+    if not request.args.get("cmd", "").strip():
         return redirect("/")
     command = request.args["cmd"].strip()
-    command = command[:1000]  # trim commands longer than 1000 characters
+    command = command[:1000]
     if "\n" in command:
         return render_template(
             "errors/error.html", title="parsing error!", message="no newlines please"
         )
 
-    s = store.Store("explainshell", config.MONGO_URI)
-    try:
-        matches, helptext = explain_cmd(command, s)
-        return render_template(
-            "explain.html", matches=matches, helptext=helptext, getargs=command
+    not_modified = _not_modified_if_fresh()
+    if not_modified is not None:
+        return not_modified
+
+    prefix = _explain_prefix(url_distro, url_release)
+    if url_distro:
+        # Explicit URL distro — strict scoping, no fallback.
+        distro, release = url_distro, url_release
+        distro_preference = None
+    else:
+        # No explicit distro — let the preference list drive lookups.
+        distro, release = None, None
+        distro_preference = sorted(
+            get_distros(),
+            key=lambda dr: (dr[0] == "ubuntu", dr[1]),
+            reverse=True,
         )
+    try:
+        matches, helptext, debug_info = explain_cmd(
+            command,
+            get_store(),
+            distro=distro,
+            release=release,
+            explain_prefix=prefix,
+            distro_preference=distro_preference,
+        )
+        helptext = [(render_markdown(text), id_) for text, id_ in helptext]
+
+        # Compute distros scoped to the matched commands (intersection).
+        cmd_names = [m["name"] for m in matches if "name" in m]
+        if cmd_names:
+            sets = [set(get_store().distros_for_name(n)) for n in cmd_names]
+            cmd_distros = sorted(sets[0].intersection(*sets[1:]))
+        else:
+            cmd_distros = list(get_distros())
+
+        body = render_template(
+            "explain.html",
+            matches=matches,
+            helptext=helptext,
+            getargs=command,
+            debug_info=debug_info,
+            available_distros=cmd_distros,
+        )
+        return _cacheable_explain_response(body)
 
     except errors.ProgramDoesNotExist as error_msg:
         return render_template(
@@ -59,51 +325,186 @@ def explain():
         return render_template("errors/error.html", title="error!", message=msg)
     except Exception as error_msg:
         logger.error(error_msg)
-        logger.error("uncaught exception trying to explain %r", command, exc_info=True)
+        logger.exception("uncaught exception trying to explain %r", command)
         msg = "something went wrong... this was logged and will be checked"
         return render_template("errors/error.html", title="error!", message=msg)
 
 
-@app.route("/explain/<program>", defaults={"section": None})
-@app.route("/explain/<section>/<program>")
-def explain_old(section, program):
-    logger.info("/explain section=%r program=%r", section, program)
+def _handle_explain_program(section, program, url_distro, url_release):
+    logger.info(
+        "/explain section=%r program=%r distro=%r release=%r",
+        section,
+        program,
+        url_distro,
+        url_release,
+    )
 
-    s = store.Store("explainshell", config.MONGO_URI)
     if section is not None:
         program = f"{program}.{section}"
 
-    # keep links to old urls alive
-    if "args" in request.args:
-        args = request.args["args"]
-        command = f"{program} {args}"
-        return redirect(f"/explain?cmd={urllib.parse.quote_plus(command)}", 301)
+    not_modified = _not_modified_if_fresh()
+    if not_modified is not None:
+        return not_modified
+
+    if url_distro:
+        distros_to_try = [(url_distro, url_release)]
     else:
+        distros_to_try = sorted(
+            get_distros(),
+            key=lambda dr: (dr[0] == "ubuntu", dr[1]),
+            reverse=True,
+        )
+
+    last_error = None
+    for d, r in distros_to_try:
         try:
-            mp, suggestions = explain_program(program, s)
-            return render_template("options.html", mp=mp, suggestions=suggestions)
-        except errors.ProgramDoesNotExist as e:
-            return render_template(
-                "errors/missingmanpage.html", title="missing man page", e=e
+            mp, suggestions, raw_mp, debug_info = explain_program(
+                program, get_store(), distro=d, release=r
             )
+            cmd_distros = get_store().distros_for_name(raw_mp.name)
+            body = render_template(
+                "options.html",
+                mp=mp,
+                suggestions=suggestions,
+                raw_mp=raw_mp,
+                debug_info=debug_info,
+                available_distros=cmd_distros,
+            )
+            return _cacheable_explain_response(body)
+        except errors.ProgramDoesNotExist as e:
+            last_error = e
+            continue
+
+    return render_template(
+        "errors/missingmanpage.html", title="missing man page", e=last_error
+    )
 
 
-def explain_program(program, store):
-    mps = store.find_man_page(program)
-    mp = mps.pop(0)
-    program = mp.name_section
+# 5 minutes in the browser, 7 days at the CDN, so a fix reaches clients
+# within minutes instead of being pinned in their cache for a week. The
+# ETag flips on every deploy, so the revalidations this costs are answered
+# with a 304 short-circuit before any rendering work (see
+# `_not_modified_if_fresh`).
+#
+# No stale-while-revalidate: it is not scopable to shared caches, so a grace
+# window here would let browsers keep serving the stale copy we just
+# shortened max-age to get rid of. Worth reintroducing alongside a
+# Cloudflare cache rule for HTML, which today bypasses /explain entirely.
+_EXPLAIN_CACHE_CONTROL = "public, max-age=300, s-maxage=604800"
 
-    synopsis = mp.synopsis
-    if synopsis:
-        synopsis = synopsis.decode("utf-8")
+
+def _explain_etag() -> str | None:
+    """Return the ETag for cacheable explain responses, or None in DEBUG.
+
+    ``<db_sha256[:16]>-<app_version>`` — two deploy-wide constants, so it
+    flips on any DB rebuild or code change and stays stable otherwise. It
+    deliberately does not depend on the request: caches key on the URL and
+    only use the ETag to validate that key, so one value per deploy is
+    enough to tell a client whether its copy is current.
+    """
+    if current_app.config.get("DEBUG"):
+        return None
+    db_sha = current_app.config.get("DB_SHA256", "local")
+    app_ver = current_app.config.get("APP_VERSION", "local")
+    return f"{db_sha[:16]}-{app_ver}"
+
+
+def _not_modified_if_fresh():
+    """Return a 304 when the client's cached copy is current, else None.
+
+    Because the ETag is request-independent, this can run before the page
+    is built — a match means the render would be byte-identical to what the
+    client already holds, so the parse, matcher walk, DB lookups and
+    template render are all skipped. Without it a revalidation costs the
+    same CPU as a miss and only saves bandwidth.
+
+    Only responses from `_cacheable_explain_response` carry an ETag, so a
+    validator can only have come from a cacheable 200 for this same URL;
+    error pages stay uncached and unaffected.
+    """
+    etag = _explain_etag()
+    if etag is None or not request.if_none_match.contains_weak(etag):
+        return None
+    response = current_app.response_class(status=304)
+    response.set_etag(etag, weak=True)
+    response.headers["Cache-Control"] = _EXPLAIN_CACHE_CONTROL
+    response.headers["Vary"] = "Accept-Encoding"
+    return response
+
+
+def _cacheable_explain_response(body: str):
+    """Wrap *body* in a Response with ETag + Cache-Control headers.
+
+    Error paths don't go through this helper; they stay uncached.
+
+    ``Vary: Accept-Encoding`` is set explicitly: we never emit
+    ``Set-Cookie`` and don't use Flask sessions, so cookies must not
+    enter CF's cache key.
+    """
+    etag = _explain_etag()
+    if etag is None:
+        return make_response(body)
+    response = make_response(body)
+    response.set_etag(etag, weak=True)
+    response.headers["Cache-Control"] = _EXPLAIN_CACHE_CONTROL
+    response.headers["Vary"] = "Accept-Encoding"
+    response.make_conditional(request)
+    return response
+
+
+def manpage_url(source):
+    """Resolve a manpage source path to an external URL, or None."""
+    parts = source.split("/")
+    section_dir = parts[-2]  # e.g. "1" from "ubuntu/26.04/1/cat.1posix.gz"
+    basename = parts[-1]
+    name_with_section = basename[:-3]  # remove .gz
+    name, section = name_with_section.rsplit(".", 1)
+
+    best_match = None
+    best_len = 0
+    for prefix, template in config.MANPAGE_URLS.items():
+        if source.startswith(prefix + "/") and len(prefix) > best_len:
+            best_match = template
+            best_len = len(prefix)
+
+    if best_match:
+        return best_match.format(section=section, section_dir=section_dir, name=name)
+    return None
+
+
+def explain_program(program, store, distro=None, release=None):
+    mps = store.find_man_page(program, distro=distro, release=release)
+    raw_mp = mps.pop(0)
+    program = raw_mp.name_section
+
+    synopsis = raw_mp.synopsis
+    if not synopsis:
+        synopsis = None
+
+    url = manpage_url(raw_mp.source)
 
     mp = {
-        "source": mp.source[:-3],
-        "section": mp.section,
+        "source": os.path.basename(raw_mp.source)[:-3],
+        "section": raw_mp.section,
         "program": program,
         "synopsis": synopsis,
-        "options": [o.text.decode("utf-8") for o in mp.options],
+        "options": [render_markdown(o.text) for o in raw_mp.options],
+        "url": url,
     }
+
+    debug_info = {}
+    if config.DEBUG:
+        for i, o in enumerate(raw_mp.options):
+            debug_info[f"option-{i}"] = {
+                "kind": "option",
+                "short": o.short,
+                "long": o.long,
+                "has_argument": o.has_argument,
+                "positional": o.positional,
+                "prefix": o.prefix,
+                "nested_cmd": o.nested_cmd,
+                "meta": o.meta,
+            }
 
     suggestions = []
     for other_mp in mps:
@@ -113,7 +514,7 @@ def explain_program(program, store):
         }
         suggestions.append(d)
     logger.info("suggestions: %s", suggestions)
-    return mp, suggestions
+    return mp, suggestions, raw_mp, debug_info
 
 
 def _make_match(start, end, match, cmd_class, help_class):
@@ -127,8 +528,21 @@ def _make_match(start, end, match, cmd_class, help_class):
     }
 
 
-def explain_cmd(command, store):
-    matcher_ = matcher.Matcher(command, store)
+def explain_cmd(
+    command,
+    store,
+    distro=None,
+    release=None,
+    explain_prefix="/explain",
+    distro_preference=None,
+):
+    matcher_ = matcher.Matcher(
+        command,
+        store,
+        distro=distro,
+        release=release,
+        distro_preference=distro_preference,
+    )
     groups = matcher_.match()
     expansions = matcher_.expansions
 
@@ -153,8 +567,6 @@ def explain_cmd(command, store):
         help_class = f"help-{len(text_ids)}"
 
         text = str(m.text)
-        if isinstance(m.text, bytes):
-            text = m.text.decode("utf-8")
         if len(text.replace("None", "")) > 0:
             help_class = text_ids.setdefault(text, help_class)
         else:
@@ -166,7 +578,7 @@ def explain_cmd(command, store):
             id_start_pos.setdefault(help_class, m.start)
 
         d = _make_match(m.start, m.end, m.match, cmd_class, help_class)
-        format_match(d, m, expansions)
+        format_match(d, m, expansions, explain_prefix=explain_prefix)
 
         ln.append(d)
     matches.append(ln)
@@ -180,8 +592,6 @@ def explain_cmd(command, store):
             help_class = f"help-{len(text_ids)}"
 
             text = str(m.text)
-            if isinstance(m.text, bytes):
-                text = m.text.decode("utf-8")
 
             if len(text.replace("None", "")) > 0:
                 help_class = text_ids.setdefault(text, help_class)
@@ -192,7 +602,7 @@ def explain_cmd(command, store):
                 id_start_pos.setdefault(help_class, m.start)
 
             d = _make_match(m.start, m.end, m.match, cmd_class, help_class)
-            format_match(d, m, expansions)
+            format_match(d, m, expansions, explain_prefix=explain_prefix)
 
             ln.append(d)
 
@@ -204,13 +614,13 @@ def explain_cmd(command, store):
             if "." not in d["match"]:
                 d["match"] = f"{d['match']}({d['section']})"
             d["suggestions"] = cmd_group.suggestions
-            d["source"] = cmd_group.manpage.source[:-5]
+            d["source"] = cmd_group.manpage.name
+            d["url"] = manpage_url(cmd_group.manpage.source)
         matches.append(ln)
 
     matches = list(itertools.chain.from_iterable(matches))
     helpers.suggestions(matches, command)
 
-    # _check_overlaps(matcher_.s, matches)
     matches.sort(key=lambda d: d["start"])
 
     it = util.Peekable(iter(matches))
@@ -223,10 +633,18 @@ def explain_cmd(command, store):
 
     helptext = sorted(text_ids.items(), key=lambda kv: id_start_pos[kv[1]])
 
-    return matches, helptext
+    debug_info = {}
+    if config.DEBUG:
+        for group in groups:
+            for m in group.results:
+                if m.debug_info and m.text in text_ids:
+                    help_class = text_ids[m.text]
+                    debug_info.setdefault(help_class, m.debug_info)
+
+    return matches, helptext, debug_info
 
 
-def format_match(d, m, expansions):
+def format_match(d, m, expansions, explain_prefix="/explain"):
     """populate the match field in d by escaping m.match and generating
     links to any command/process substitutions"""
 
@@ -268,7 +686,7 @@ def format_match(d, m, expansions):
             s = m.match[rel_start:rel_end]
 
             if kind == "substitution":
-                content = markupsafe.Markup(_substitution_markup(s))
+                content = _substitution_markup(s, explain_prefix)
             else:
                 content = s
 
@@ -284,25 +702,23 @@ def format_match(d, m, expansions):
     d["match"] = expanded_match
 
 
-def _substitution_markup(cmd):
-    """
+def _substitution_markup(
+    cmd: str, explain_prefix: str = "/explain"
+) -> markupsafe.Markup:
+    """Build the link shown for a nested command inside a substitution.
+
+    Every interpolated value is escaped. ``explain_prefix`` is derived from
+    the request path by `_explain_prefix`, and its release segment is not
+    validated, so it must not be treated as trusted markup either.
+
     >>> _substitution_markup('foo')
-    '<a href="/explain?cmd=foo" title="Zoom in to nested command">foo</a>'
+    Markup('<a href="/explain?cmd=foo" title="Zoom in to nested command">foo</a>')
     >>> _substitution_markup('cat <&3')
-    '<a href="/explain?cmd=cat+%3C%263" title="Zoom in to nested command">cat <&3</a>'
+    Markup('<a href="/explain?cmd=cat+%3C%263" title="Zoom in to nested command">cat &lt;&amp;3</a>')
+    >>> _substitution_markup('ls', '/explain/ubuntu/"onmouseover=alert(1) x="')
+    Markup('<a href="/explain/ubuntu/&#34;onmouseover=alert(1) x=&#34;?cmd=ls" title="Zoom in to nested command">ls</a>')
     """
     encoded = urllib.parse.urlencode({"cmd": cmd})
-    return (
-        '<a href="/explain?{query}" title="Zoom in to nested command">{cmd}' "</a>"
-    ).format(cmd=cmd, query=encoded)
-
-
-def _check_overlaps(s, matches):
-    explained = [None] * len(s)
-    for d in matches:
-        for i in range(d["start"], d["end"]):
-            if explained[i]:
-                raise RuntimeError(
-                    f"explained overlap for group {d} at {i} with {explained[i]}"
-                )
-            explained[i] = d
+    return markupsafe.Markup(
+        '<a href="{prefix}?{query}" title="Zoom in to nested command">{cmd}</a>'
+    ).format(prefix=explain_prefix, query=encoded, cmd=cmd)

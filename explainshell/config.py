@@ -1,14 +1,37 @@
 import os
 
-_curr_dir = os.path.dirname(os.path.dirname(__file__))
-
-MAN_PAGE_DIR = os.path.join(_curr_dir, "manpages")
-CLASSIFIER_CUTOFF = 0.7
-TOOLS_DIR = os.path.join(_curr_dir, "tools")
-
-MAN2HTML = os.path.join(TOOLS_DIR, "w3mman2html.cgi")
-
 # host to pass into Flask's app.run.
 HOST_IP = os.getenv("HOST_IP", "")
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost")
-DEBUG = True
+DB_PATH = os.getenv("DB_PATH")
+DEBUG = os.getenv("DEBUG", "true").lower() not in ("0", "false", "no")
+MANDOC_PATH = os.getenv(
+    "MANDOC_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools", "mandoc-md"),
+)
+
+# Mapping from source-path prefix to external URL template.
+# Templates may use {section} and {name} placeholders.
+MANPAGE_URLS = {
+    "ubuntu/26.04": "https://manpages.ubuntu.com/manpages/resolute/en/man{section_dir}/{name}.{section}.html",
+    "arch": "https://man.archlinux.org/man/{name}.{section}",
+}
+
+
+def parse_distro_release(source):
+    """Extract (distro, release) from a source path.
+
+    All source paths follow the ``distro/release/section/file.gz`` format:
+      "ubuntu/26.04/1/ps.1.gz" -> ("ubuntu", "26.04")
+    """
+    parts = source.split("/")
+    return parts[0], parts[1]
+
+
+def source_from_path(gz_path):
+    """Return the ``distro/release/section/name.section.gz`` source identifier.
+
+    Extracts the last four path components, which by convention are
+    ``distro/release/section/file.gz``.
+    """
+    parts = os.path.normpath(gz_path).split(os.sep)
+    return "/".join(parts[-4:])

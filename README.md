@@ -1,270 +1,196 @@
-# 🚀 explainshell - Community Integration Fork
+# explainshell — Community Integration Fork
 
-> **Python 3.12 Compatible** | **Modern Dependencies** | **Security Fixes** | **Dark Mode Support**
-
-This is a community-maintained fork of [idank/explainshell](https://github.com/idank/explainshell) that integrates valuable open pull requests into a working, tested Python 3.12-compatible version.
-
-[![Original Project](https://img.shields.io/badge/Original-idank/explainshell-blue)](https://github.com/idank/explainshell)
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-green)](https://www.python.org/downloads/)
-[![Flask 3.0](https://img.shields.io/badge/Flask-3.0.3-orange)](https://flask.palletsprojects.com/)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+> Fork of [idank/explainshell](https://github.com/idank/explainshell), synced with upstream.
+> See [COMMUNITY_INTEGRATION.md](./COMMUNITY_INTEGRATION.md) for the history of community PRs this fork integrated.
 
 ---
 
-## 🆕 What's New in This Fork
+# [explainshell.com](http://www.explainshell.com) - match command-line arguments to their help text
 
-This fork integrates **6 valuable community pull requests** from the original repository:
-This fork integrates **6 valuable community pull requests** from the original repository:
+[![CI](https://github.com/idank/explainshell/actions/workflows/ci.yml/badge.svg)](https://github.com/idank/explainshell/actions/workflows/ci.yml)
+[![Deploy](https://img.shields.io/github/actions/workflow/status/idank/explainshell/do-deploy.yml?label=deploy&logo=digitalocean&logoColor=white)](https://github.com/idank/explainshell/actions/workflows/do-deploy.yml)
 
-| Feature | Status | PR | Contributor |
-|---------|--------|-----|-------------|
-| 🐍 Python 3.12 Migration | ✅ | [#330](https://github.com/idank/explainshell/pull/330) | [@mundanevision20](https://github.com/mundanevision20) |
-| 🔧 pymongo 4.x Compatibility | ✅ | [#323](https://github.com/idank/explainshell/pull/323) | [@cben](https://github.com/cben) |
-| 🌙 Dark Mode Support | ✅ | [#237](https://github.com/idank/explainshell/pull/237) | [@rugk](https://github.com/rugk) |
-| 🎨 Search Box Fix | ✅ | [#248](https://github.com/idank/explainshell/pull/248) | [@apoorvlathey](https://github.com/apoorvlathey) |
-| 📚 Better Examples | ✅ | [#293](https://github.com/idank/explainshell/pull/293) | [@Strahinja](https://github.com/Strahinja) |
-| 📖 Ubuntu Noble Manpages | ✅ | [#232](https://github.com/idank/explainshell/pull/232) | [@wesinator](https://github.com/wesinator) |
+explainshell is a tool (with a web interface) capable of parsing manpages, extracting options and
+explaining a given command-line by matching each argument to the relevant help text in the manpage.
 
-**See [COMMUNITY_INTEGRATION.md](./COMMUNITY_INTEGRATION.md) for detailed information.**
+## How?
 
-## ⚠️ Manpages Status
+explainshell is built from the following components:
 
-> [!IMPORTANT]
->
-> explainshell is actively maintained in terms of keeping it healthy and functional -- issues are addressed, and the core remains stable.
->
-> However, please note that the **manpages are outdated**. The previous system for generating them was unsustainable, and they haven't been updated in some time. There are currently **no active plans** to revise this mechanism.
->
-> If you're relying on manpages, be aware that they may not reflect the latest behavior. Contributions in this area are welcome but would require rethinking the documentation pipeline.
----
+1. manpage reader which extracts metadata (name, synopsis, aliases) from a given manpage (manpage.py)
+2. an options extractor that parses roff macros or uses an LLM to extract options (extraction/)
+3. a storage backend that saves processed manpages to sqlite (store.py)
+4. a matcher that walks the command's AST (parsed by [bashlex](https://github.com/idank/bashlex)) and contextually
+   matches each node to the relevant help text (matcher.py)
 
-## 📋 Table of Contents
+When querying explainshell, it:
 
-- [About explainshell](#about-explainshell)
-- [Why This Fork?](#why-this-fork)
-- [Key Improvements](#key-improvements)
-- [Quick Start](#quick-start)
-- [Documentation](#documentation)
-- [Contributing](#contributing)
-- [Credits](#credits)
+1. parses the query into an AST
+2. visits interesting nodes in the AST, such as:
+   - command nodes - these nodes represent a simple command
+   - shell related nodes - these nodes represent something the shell
+     interprets such as '|', '&&'
+3. for every command node we check if we know how to explain the current program,
+   and then go through the rest of the tokens, trying to match each one to the
+   list of known options
+4. returns a list of matches that are rendered with Flask
 
----
-
-## 🤔 About explainshell
-
-[explainshell.com](http://www.explainshell.com) is a tool capable of parsing man pages, extracting options and explaining a given command-line by matching each argument to the relevant help text in the man page.
-
-### How It Works
-
-explainshell is built from these components:
-
-1. **Man page reader** - Converts man pages from raw format to HTML
-2. **Classifier** - Identifies paragraphs containing options
-3. **Options extractor** - Scans and extracts options from classified paragraphs
-4. **Storage backend** - Saves processed man pages to MongoDB
-5. **Matcher** - Walks the command's AST (parsed by [bashlex](https://github.com/idank/bashlex)) and matches nodes to help text
-
-When you query explainshell:
-
-1. Parses your command into an AST
-2. Visits interesting nodes (commands, shell operators like `|`, `&&`)
-3. Matches each token to known options and help text
-4. Returns formatted matches via Flask web interface
-
----
-
-## 🎯 Why This Fork?
-
-The original explainshell is an **amazing tool**, but it's been stuck on **Python 2.7** (end-of-life since 2020) with several valuable community contributions waiting for review.
-
-### The Problem
+## Running explainshell locally
 
 ```bash
-$ docker compose build
-# ❌ Error: Debian Buster repositories not found
-# ❌ Error: Python 2.7 packages unavailable
-# ❌ Security vulnerabilities in old dependencies
+# Clone repository
+$ git clone https://github.com/idank/explainshell.git
+$ cd explainshell
+
+# Set up Python virtualenv
+$ python3 -m venv .venv
+$ source .venv/bin/activate
+$ pip install -r requirements-dev.txt
+
+# Download the live db
+$ make download-latest-db
+
+# Or parse a manpage
+$ python -m explainshell.manager extract --mode llm:codex/gpt-5.6-sol/medium manpages/ubuntu/26.04/1/tar.1.gz
+
+# Run the web server
+$ make serve
+# open http://localhost:5000
 ```
 
-### The Solution
+## Storage
 
-This fork:
-- ✅ **Works with modern Docker images**
-- ✅ **Fixes security vulnerabilities**
-- ✅ **Integrates tested community improvements**
-- ✅ **Provides Python 3.12 compatibility**
-- ✅ **Maintains backward compatibility for users**
+Processed manpages live in a single SQLite database (`explainshell.db`) with three tables:
 
----
+- **manpages**: zlib-compressed manpage source text (typically markdown produced by `mandoc -T markdown`). Keyed by a `source` path in the format `distro/release/section/name.section.gz` (e.g. `ubuntu/26.04/1/tar.1.gz`).
+- **parsed_manpages**: extracted options, synopsis, aliases, and behavioral flags for each manpage. Options are stored as a JSON list.
+- **mappings**: maps command names to `parsed_manpages` rows (many-to-one, with a score for preference). A single manpage can have multiple mappings - one per alias and one per sub-command form (e.g. `git commit` maps to the `git-commit` manpage).
 
-## 🔥 Key Improvements
+The `source` path is the primary key across both `manpages` and `parsed_manpages`, and doubles as a namespace: queries can be scoped to a specific distro/release by filtering on the path prefix.
 
-### Security Enhancements
+The db for the live service is saved in a Github release.
 
-| Component | Before | After | Benefit |
-|-----------|--------|-------|---------|
-| Python | 2.7 (EOL) | 3.12 | Modern security patches |
-| Flask | 0.12 | 3.0.3 | CVE-2023-30861 fixed |
-| nltk | 3.4.5 | 3.9.1 | ReDoS vulnerabilities fixed |
-| pymongo | 3.13.0 | 4.8.0 | Modern MongoDB support |
+## Manpage archives
 
-### User Experience
+explainshell.com sources manpages from known archives (currently the Ubuntu archive and manned.org). All manpage sources
+(gz files) are committed to explainshell-manpages (a git submodule of this repo). It's not necessary to clone this repo
+to run explainshell locally.
 
-- 🌙 **Auto Dark Mode**: Respects system preferences
-- 🎨 **Fixed UI**: No more search box overlap
-- 📚 **Modern Examples**: Uses current best practices, not deprecated syntax
-- 📖 **Latest Docs**: Ubuntu 24.04 LTS (noble) man pages
-
-### Developer Experience
-
-- 🐍 **Python 3.12**: Modern syntax and features
-- 📝 **Better Logging**: Enhanced with loguru
-- 🐳 **Docker Support**: Works with current images
-- 🔧 **Type Hints**: Improved code quality
-
----
-
-## 🚀 Quick Start
-
-### Option 1: Docker (Recommended)
+To generate the archive locally:
 
 ```bash
-# Clone this fork
-git clone https://github.com/tobiashochguertel/explainshell.git
-cd explainshell
-
-# Start the application
-docker compose up --build
+$ git submodule update --init --recursive
+$ make ubuntu-archive UBUNTU_RELEASE=resolute
+$ make arch-archive # Arch only has a 'latest' archive
 ```
 
-Visit http://localhost:5000 🎉
+This outputs gzipped manpages under `manpages/<distro>/<release>/`.
 
-### Option 2: Local Python
+### Processing manpages
+
+The manager CLI requires a database path for most commands. Set it via the `DB_PATH` environment variable or pass `--db <path>` on the command line. Commands that don't need a database (e.g. `extract --dry-run`, `diff extractors`) work without it.
+
+Use the manager to extract options from gzipped manpages and save them to the database:
 
 ```bash
-# Clone and install
-git clone https://github.com/tobiashochguertel/explainshell.git
-cd explainshell
-pip install -r requirements.txt
+# Calls out to 'codex exec' to extract the manpage and writes the result to test.db.
+$ python -m explainshell.manager --db test.db extract --mode llm:codex/gpt-5.6-sol/medium manpages/ubuntu/26.04/1/tar.1.gz
 
-# Run the application
-python3 runserver.py
+# Or set DB_PATH:
+$ export DB_PATH=$(pwd)/test.db
+
+# Can also use an API key (see .env.example).
+$ python -m explainshell.manager extract --mode llm:openai/gpt-5-mini manpages/ubuntu/26.04/1/find.1.gz
+$ python -m explainshell.manager extract --mode llm:openai/gpt-5-mini --batch 50 manpages/ubuntu/26.04/
 ```
 
-### Option 3: With Man Pages Database
+The `--mode` flag selects the extraction strategy:
+
+- `llm:<provider/model>`: sends the manpage text (converted to markdown via `mandoc -T markdown`) to an LLM for extraction. The LLM returns line ranges into the source text, not generated descriptions, so hallucinations are structurally impossible - the actual help text is always sliced from the original manpage. Example: `--mode llm:openai/gpt-5-mini`.
+
+Other `extract` flags: `--overwrite` (re-process existing entries), `--filter-db <spec>` (with `--overwrite`, only re-extract rows whose stored extractor matches `<spec>`; same syntax as `--mode`; repeatable to match any of several specs), `--dry-run` (extract without writing to DB), `-j <N>` (parallel workers), `--batch <N>` (provider batch API for LLM modes, including `gemini/`, `openai/`, and `azure/`), `--small-only` / `--large-only` (partition the corpus at ~2 KB gz so a cheap model handles small pages and a capable one handles the rest):
 
 ```bash
-# Download man pages database
-curl -L -o /tmp/dump.gz https://github.com/idank/explainshell/releases/download/db-dump/dump.gz
-
-# Clone and start
-git clone https://github.com/tobiashochguertel/explainshell.git
-cd explainshell
-docker compose up --build
+# pass 1 - cheap model on small pages
+$ python -m explainshell.manager extract --mode llm:codex/gpt-5.6-luna/medium --small-only manpages/...
+# pass 2 - capable model on the rest (already-stored small pages are skipped)
+$ python -m explainshell.manager extract --mode llm:codex/gpt-5.6-sol/medium --large-only manpages/...
 ```
 
----
+To compare extraction results, use the `diff` subcommand:
 
-## 📚 Documentation
+```bash
+# Diff against the database
+$ python -m explainshell.manager diff db --mode llm:openai/gpt-5-mini manpages/ubuntu/26.04/1/tar.1.gz
 
-- **[COMMUNITY_INTEGRATION.md](./COMMUNITY_INTEGRATION.md)** - What's integrated and why
-- **[PR_ANALYSIS.md](./PR_ANALYSIS.md)** - Comprehensive analysis of all 12 open PRs
-- **[Original README](https://github.com/idank/explainshell/blob/master/README.md)** - Original documentation
-
-### Updated Dependencies
-
-```txt
-Flask==3.0.3        # was 0.12
-nltk==3.9.1         # was 3.4.5
-pymongo==4.8.0      # was 3.13.0
-bashlex==0.18       # was 0.12
-loguru==0.7.2       # new
-nose==1.3.7         # same
+# Compare two extractors head-to-head
+$ python -m explainshell.manager diff extractors llm:openai/gpt-5-mini..llm:openai/gpt-5 manpages/ubuntu/26.04/1/tar.1.gz
 ```
 
----
+### Querying the database
 
-## 🤝 Contributing
+```bash
+# Show aggregate stats
+$ python -m explainshell.manager show stats
 
-We welcome contributions! This fork aims to:
+# Look up a command
+$ python -m explainshell.manager show manpage tar
 
-1. **Maintain** compatibility with the original project
-2. **Integrate** valuable community contributions
-3. **Provide** a working version for users needing Python 3
+# List available distros
+$ python -m explainshell.manager show distros
 
-### How to Contribute
+# Run integrity checks
+$ python -m explainshell.manager db-check
+```
 
-1. Fork this repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+## Tests
 
----
+```bash
+$ make tests-all          # lint + unit tests + e2e
+```
 
-## 🙏 Credits
+### LLM evaluation
 
-### Original Project
+The LLM eval (`tests/evals/llm/llm_eval.py`) runs the LLM extractor on the corpus listed in `tests/evals/llm/corpus.txt` and produces a `summary.json` plus per-page artifacts (`markdown/`, `prompts/`, `responses/`). Runs are auto-saved with timestamps to `tests/evals/llm/runs/<timestamp>-<label>/` and include git metadata.
 
-**Massive thanks to [@idank](https://github.com/idank)** for creating this incredible tool!
+The idea is to run it before making changes that affect the LLM extractor pipeline (producing a baseline), and then again
+with the changes. Some variance between runs is expected due to LLM indeterminism.
 
-- **Original Repository**: https://github.com/idank/explainshell
-- **Live Site**: https://explainshell.com
+```bash
+# Run on the default corpus, parallelizing realtime calls
+$ python tests/evals/llm/llm_eval.py run --label baseline --model openai/gpt-5-mini --jobs 10
 
-### Community Contributors
+# Compare two run directories (oldest first)
+$ python tests/evals/llm/llm_eval.py compare tests/evals/llm/runs/<baseline-run> tests/evals/llm/runs/<current-run>
 
-This fork wouldn't exist without these amazing contributors:
+# List all saved runs
+$ python tests/evals/llm/llm_eval.py list
+```
 
-- **[@mundanevision20](https://github.com/mundanevision20)** - Python 3.12 migration ([PR #330](https://github.com/idank/explainshell/pull/330))
-- **[@cben](https://github.com/cben)** - pymongo compatibility ([PR #323](https://github.com/idank/explainshell/pull/323))
-- **[@rugk](https://github.com/rugk)** - Dark mode support ([PR #237](https://github.com/idank/explainshell/pull/237))
-- **[@apoorvlathey](https://github.com/apoorvlathey)** - Search box fix ([PR #248](https://github.com/idank/explainshell/pull/248))
-- **[@Strahinja](https://github.com/Strahinja)** - Better examples ([PR #293](https://github.com/idank/explainshell/pull/293))
-- **[@wesinator](https://github.com/wesinator)** - Updated manpages ([PR #232](https://github.com/idank/explainshell/pull/232))
+Use `--batch <size>` instead of `--jobs` to route through the provider's batch API - cheaper but minutes-to-hours of queue latency, so it pays off only on much larger corpora than the default 12-page one.
 
-### Fork Maintainer
+### Markdown render eval
 
-**Tobias Hochgürtel** ([@tobiashochguertel](https://github.com/tobiashochguertel))
+A review-oriented harness for `mandoc -T markdown` changes lives in `tests/evals/render/`. It renders a vendored manpage corpus with two mandoc binaries, compares structural metrics, and builds a screenshot diff report with a draggable expected/actual slider. It is intentionally not part of `make tests-all` - run it manually when changing the markdown rendering path. See [tests/evals/render/README.md](tests/evals/render/README.md) for usage.
 
----
+## Thanks
 
-## 📜 License
+Thanks to the following companies for including explainshell in their open source programs:
 
-GPL-3.0 License (same as the original project)
+<p align="center">
+  <a href="https://claude.com/contact-sales/claude-for-oss"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/simple-icons/anthropic.svg?color=%23ffffff&height=56"><img src="https://api.iconify.design/simple-icons/anthropic.svg?color=%23191919&height=56" alt="Anthropic" height="56"></picture></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.datadoghq.com/partner/open-source/"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/simple-icons/datadog.svg?color=%239b72d0&height=56"><img src="https://api.iconify.design/simple-icons/datadog.svg?color=%23632ca6&height=56" alt="Datadog" height="56"></picture></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://www.digitalocean.com/open-source"><img src="https://api.iconify.design/simple-icons/digitalocean.svg?color=%230080ff&height=56" alt="DigitalOcean" height="56"></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+  <a href="https://openai.com/form/codex-for-oss/"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/simple-icons/openai.svg?color=%23ffffff&height=56"><img src="https://api.iconify.design/simple-icons/openai.svg?color=%23412991&height=56" alt="OpenAI" height="56"></picture></a>
+</p>
 
-Copyright (C) 2024 Tobias Hochgürtel
-Copyright (C) 2013-2024 Idan Kamara
+## License
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation.
+The explainshell **code** is licensed under [GPLv3](LICENSE).
 
----
+The released **database** is a different matter: it contains the (near-)verbatim text of tens of thousands of man pages extracted from Ubuntu and Arch Linux packages. Each of those pages keeps its own upstream license (GPL, BSD, MIT, and many others) held by its respective authors - the GPLv3 above does **not** cover them, and I can't relicense them. My own contribution to the database (the selection, schema, and extracted option structure) is a thin layer on top of that content.
 
-## 🔗 Links
-
-- 🏠 **Original Project**: https://github.com/idank/explainshell
-- 🌐 **Live Demo**: https://explainshell.com
-- 🐛 **Issues**: Report issues in the [original repo](https://github.com/idank/explainshell/issues) or this fork
-- 📊 **PR Analysis**: [PR_ANALYSIS.md](./PR_ANALYSIS.md)
-
----
-
-## ⚠️ Note to Users
-
-This fork exists to:
-1. Help the community use explainshell on modern infrastructure
-2. Demonstrate that community PRs work and are valuable
-3. Provide an interim solution while the original project is updated
-
-**We encourage you to support the [original project](https://github.com/idank/explainshell)!**
-
-If the original maintainer merges these PRs, this fork may become unnecessary (which would be great! 🎉)
-
----
-
-<div align="center">
-
-**Made with ❤️ by the open source community**
-
-[⭐ Star this repo](https://github.com/tobiashochguertel/explainshell) | [🐛 Report Bug](https://github.com/tobiashochguertel/explainshell/issues) | [💡 Request Feature](https://github.com/tobiashochguertel/explainshell/issues)
-
-</div>
+If you want to redistribute the database (or a derivative of it), the permission has to come from the licenses of the individual man pages - do your own compliance review, and preserve the upstream authors' copyright notices as their licenses require. The `source` column tells you which distro/release each page came from.
