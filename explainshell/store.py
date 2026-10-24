@@ -1,519 +1,690 @@
 """
-data objects to save processed man pages to mongodb
+data objects to save processed man pages to sqlite
 """
 
-import collections
-import re
+import datetime
+import json
 import logging
+import os
+import re
+import sqlite3
+import zlib
+from collections.abc import Iterator
+from typing import NamedTuple
 
-# from pprint import pprint
-
-import pymongo
-from bson import ObjectId
-
-from explainshell import errors, help_constants, util, config
+from explainshell import config, errors, util
+from explainshell.models import ExtractionMeta, ParsedManpage, RawManpage
 
 logger = logging.getLogger(__name__)
 
-
-class ClassifierManpage(collections.namedtuple("ClassifierManpage", "name paragraphs")):
-    """a man page that had its paragraphs manually tagged as containing options
-    or not"""
-
-    @staticmethod
-    def from_store(d):
-        m = ClassifierManpage(
-            d["name"], [Paragraph.from_store(p) for p in d["paragraphs"]]
-        )
-        return m
-
-    def to_store(self):
-        return {
-            "name": self.name,
-            "paragraphs": [p.to_store() for p in self.paragraphs],
-        }
+_SOURCE_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*/[^/]+/[^/]+/[^/]+\.\d\w*\.gz$")
 
 
-class Paragraph:
-    """a paragraph inside a man page is text that ends with two new lines"""
+def validate_source_path(source: str) -> None:
+    """Validate that *source* has the ``distro/release/section/name.section.gz`` format.
 
-    def __init__(self, idx, text, section, is_option):
-        self.idx = idx
-        self.text = text
-        self.section = section
-        self.is_option = is_option
-
-        if not isinstance(self.text, str):
-            self.text = self.text.decode("utf-8")
-
-    def clean_text(self):
-        t = re.sub(r"<[^>]+>", "", self.text)
-        t = re.sub("&lt;", "<", t)
-        t = re.sub("&gt;", ">", t)
-        return t
-
-    @staticmethod
-    def from_store(d):
-        p = Paragraph(
-            d.get("idx", 0), d["text"].encode("utf8"), d["section"], d["is_option"]
-        )
-        return p
-
-    def to_store(self):
-        return {
-            "idx": self.idx,
-            "text": self.text,
-            "section": self.section,
-            "is_option": self.is_option,
-        }
-
-    def __repr__(self):
-        t = self.clean_text()
-        t = t[: min(20, t.find("\n"))].lstrip()
-        return f"<paragraph {self.idx}, {self.section}: {t}>"
-
-    def __eq__(self, other):
-        if not other:
-            return False
-        return self.__dict__ == other.__dict__
-
-
-class Option(Paragraph):
-    """a paragraph that contains extracted options
-
-    short - a list of short options (-a, -b, ..)
-    long - a list of long options (--a, --b)
-    expects_arg - specifies if one of the short/long options expects an additional argument
-    argument - specifies if to consider this as positional arguments
-    nested_cmd - specifies if the arguments to this option can start a nested command
+    Raises ``errors.InvalidSourcePath`` on failure.
     """
-
-    def __init__(self, p, short, long, expects_arg, argument=None, nested_cmd=False):
-        Paragraph.__init__(self, p.idx, p.text, p.section, p.is_option)
-        self.short = short
-        self.long = long
-        self._opts = self.short + self.long
-        self.argument = argument
-        self.expects_arg = expects_arg
-        self.nested_cmd = nested_cmd
-        if nested_cmd:
-            assert (
-                expects_arg
-            ), "an option that can nest commands must expect an argument"
-
-    @property
-    def opts(self):
-        return self._opts
-
-    @classmethod
-    def from_store(cls, d):
-        p = Paragraph.from_store(d)
-
-        # logger.debug(str(vars(d)))
-
-        return cls(
-            p,
-            d["short"],
-            d["long"],
-            d["expectsarg"],
-            d["argument"],
-            d.get("nestedcmd"),
+    if not _SOURCE_RE.match(source):
+        raise errors.InvalidSourcePath(
+            f"source path {source!r} does not match the required "
+            f"'distro/release/section/name.section.gz' format "
+            f"(e.g. 'ubuntu/26.04/1/tar.1.gz')"
         )
 
-    def to_store(self):
-        d = Paragraph.to_store(self)
-        assert d["is_option"]
-        d["short"] = self.short
-        d["long"] = self.long
-        d["expectsarg"] = self.expects_arg
-        d["argument"] = self.argument
-        d["nestedcmd"] = self.nested_cmd
-        return d
 
-    def __str__(self):
-        return "(" + ", ".join([str(x) for x in self.opts]) + ")"
+_CREATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS manpages (
+    source             TEXT    PRIMARY KEY,
+    data               BLOB   NOT NULL,
+    generated_at       TEXT   NOT NULL,
+    generator          TEXT   NOT NULL,
+    generator_version  TEXT,
+    source_gz_sha256   TEXT
+);
 
-    def __repr__(self):
-        return f"<options for paragraph {self.idx}: {self}"
+CREATE TABLE IF NOT EXISTS parsed_manpages (
+    source        TEXT    PRIMARY KEY,            -- e.g. "ubuntu/26.04/1/tar.1.gz"
+    name          TEXT    NOT NULL,               -- command name (e.g. 'git')
+    synopsis      TEXT,                           -- one-line synopsis from the man page
+    options       TEXT    NOT NULL DEFAULT '[]',  -- JSON list of option dicts
+    aliases       TEXT    NOT NULL DEFAULT '[]',  -- JSON list of [alias, score] pairs
+    dashless_opts INTEGER NOT NULL DEFAULT 0,      -- allow matching options without leading '-'
+    subcommands   TEXT    NOT NULL DEFAULT '[]',  -- JSON list of subcommand names (e.g. ["build","run","push"])
+    updated       INTEGER NOT NULL DEFAULT 0,     -- manually edited, skip during bulk imports
+    nested_cmd    TEXT    NOT NULL DEFAULT 'false', -- positional args start a nested command (e.g. sudo, xargs)
+    extractor     TEXT,                            -- extractor mode: "llm"
+    extraction_meta TEXT NOT NULL DEFAULT '{}',    -- JSON dict of additional extraction metadata
+    FOREIGN KEY (source) REFERENCES manpages(source) ON DELETE CASCADE
+);
+
+-- Maps command names (and aliases) to parsed_manpages rows.
+-- A single manpage may have many mappings (one per alias).
+-- For multi-cmd parents, sub-command mappings are also stored here
+-- (e.g. src='git commit' -> dst=<git-commit manpage id>).
+CREATE TABLE IF NOT EXISTS mappings (
+    src   TEXT    NOT NULL,      -- lookup key (command name or 'cmd subcmd')
+    dst   TEXT    NOT NULL REFERENCES parsed_manpages(source) ON DELETE CASCADE,
+    score INTEGER NOT NULL,      -- higher score = preferred match
+    PRIMARY KEY (src, dst)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mappings_dst ON mappings(dst);
+CREATE INDEX IF NOT EXISTS idx_mappings_src ON mappings(src, dst, score);
+
+-- Append-only event log for tracking DB lifecycle (extractions, uploads, etc.).
+CREATE TABLE IF NOT EXISTS db_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT    NOT NULL,  -- ISO-8601 UTC
+    event     TEXT    NOT NULL,  -- e.g. "extraction", "upload"
+    metadata  TEXT    NOT NULL DEFAULT '{}'  -- JSON blob with event-specific details
+);
+
+"""
 
 
-class ManPage:
-    """processed man page
+def _compress(text: str) -> bytes:
+    return zlib.compress(text.encode("utf-8"))
 
-    source - the path to the original source man page
-    name - the name of this man page as extracted by manpage.manpage
-    synopsis - the synopsis of this man page as extracted by manpage.manpage
-    paragraphs - a list of paragraphs (and options) that contain all of the text and options
-        extracted from this man page
-    aliases - a list of aliases found for this man page
-    partial_match - allow interpreting options without a leading '-'
-    multi_cmd - consider sub commands when explaining a command with this man page,
-        e.g. git -> git commit
-    updated - whether this man page was manually updated
-    nested_cmd - specifies if positional arguments to this program can start a nested command,
-        e.g. sudo, xargs
-    """
 
-    def __init__(
-        self,
-        source,
-        name,
-        synopsis,
-        paragraphs,
-        aliases,
-        partial_match=False,
-        multi_cmd=False,
-        updated=False,
-        nested_cmd=False,
-    ):
-        self.source = source
-        self.name = name
-        self.synopsis = synopsis
-        self.paragraphs = paragraphs
-        self.aliases = aliases
-        self.partial_match = partial_match
-        self.multi_cmd = multi_cmd
-        self.updated = updated
-        self.nested_cmd = nested_cmd
+def _decompress(data: bytes) -> str:
+    return zlib.decompress(data).decode("utf-8")
 
-    def remove_option(self, idx):
-        for i, p in self.paragraphs:
-            if p.idx == idx:
-                if not isinstance(p, Option):
-                    raise ValueError(f"paragraph {idx} isn't an option")
-                self.paragraphs[i] = Paragraph(p.idx, p.text, p.section, False)
-                return
-        raise ValueError(f"idx {idx} not found")
 
-    @property
-    def name_section(self):
-        name, section = util.name_section(self.source[:-3])
-        return f"{name}({section})"
+def _dr_prefix(source: str) -> str:
+    """Extract 'distro/release/' prefix from a source path."""
+    parts = source.split("/", 2)
+    return f"{parts[0]}/{parts[1]}/"
 
-    @property
-    def section(self):
-        name, section = util.name_section(self.source[:-3])
-        return section
 
-    @property
-    def options(self):
-        return [p for p in self.paragraphs if isinstance(p, Option)]
+class SubcommandMappingResult(NamedTuple):
+    """Result of update_subcommand_mappings."""
 
-    @property
-    def arguments(self):
-        # go over all paragraphs and look for those with the same 'argument'
-        # field
-        groups = collections.OrderedDict()
-        for opt in self.options:
-            if opt.argument:
-                groups.setdefault(opt.argument, []).append(opt)
-
-        # merge all the paragraphs under the same argument to a single string
-        for k, ln in groups.items():
-            groups[k] = "\n\n".join([p.text for p in ln])
-
-        return groups
-
-    @property
-    def synopsis_no_name(self):
-        return re.match(r"[\w|-]+ - (.*)$", self.synopsis).group(1)
-
-    def find_option(self, flag):
-        for o_tmp in self.options:
-            for o in o_tmp.opts:
-                if o == flag:
-                    return o_tmp
-
-    def to_store(self):
-        return {
-            "source": self.source,
-            "name": self.name,
-            "synopsis": self.synopsis,
-            "paragraphs": [p.to_store() for p in self.paragraphs],
-            "aliases": self.aliases,
-            "partial_match": self.partial_match,
-            "multi_cmd": self.multi_cmd,
-            "updated": self.updated,
-            "nested_cmd": self.nested_cmd,
-        }
-
-    @staticmethod
-    def from_store(d):
-        paragraphs = []
-        for pd in d.get("paragraphs", []):
-            pp = Paragraph.from_store(pd)
-            if pp.is_option is True and "short" in pd:
-                pp = Option.from_store(pd)
-            paragraphs.append(pp)
-
-        synopsis = d["synopsis"]
-        if synopsis:
-            synopsis = synopsis.encode("utf8")
-        else:
-            synopsis = help_constants.NO_SYNOPSIS
-
-        partial_match = None
-        if "partialmatch" in d:
-            partial_match = d["partialmatch"]
-        elif "partial_match" in d:
-            partial_match = d["partial_match"]
-
-        multi_cmd = None
-        if "multicommand" in d:
-            multi_cmd = d["multicommand"]
-        elif "multi_cmd" in d:
-            multi_cmd = d["multi_cmd"]
-
-        nested_cmd = None
-        if "nestedcmd" in d:
-            nested_cmd = d["nestedcmd"]
-        elif "nested_cmd" in d:
-            nested_cmd = d["nested_cmd"]
-
-        return ManPage(
-            d["source"],
-            d["name"],
-            synopsis,
-            paragraphs,
-            [tuple(x) for x in d["aliases"]],
-            partial_match,
-            multi_cmd,
-            d["updated"],
-            nested_cmd,
-        )
-
-    @staticmethod
-    def from_store_name_only(name, source):
-        return ManPage(source, name, None, [], [], None, None, None)
-
-    def __repr__(self):
-        return f"<manpage {self.name}({self.section}), {len(self.options)} options>"
+    mappings_added: list[tuple[str, str]]  # (src, dst) pairs added
+    parents: dict[str, str]  # parent name -> source
 
 
 class Store:
-    """read/write processed man pages from mongodb
+    """read/write processed man pages from sqlite"""
 
-    we use three collections:
-    1) classifier - contains manually tagged paragraphs from man pages
-    2) manpage - contains a processed man page
-    3) mapping - contains (name, manpageid, score) tuples
-    """
+    def __init__(self, db_path: str, read_only: bool = False) -> None:
+        logger.info("creating store, db_path = %r, read_only = %s", db_path, read_only)
+        # check_same_thread=False: the default sqlite3 driver raises if a
+        # connection is used from a thread other than the one that created it.
+        # Plain Store instances are expected to be used by one caller at a
+        # time. Production web serving uses CachingStore, which supplies
+        # per-thread read-only connections around the shared lookup cache.
+        if read_only:
+            self._conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, check_same_thread=False
+            )
+            self._conn.row_factory = sqlite3.Row
+        else:
+            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON")
 
-    def __init__(self, db="explainshell", host=config.MONGO_URI):
-        logger.info("creating store, db = %r, host = %r", db, host)
-        self.connection = pymongo.MongoClient(host)
-        self.db = self.connection[db]
-        self.classifier = self.db["classifier"]
-        self.manpage = self.db["manpage"]
-        self.mapping = self.db["mapping"]
+    @classmethod
+    def create(cls, db_path: str) -> "Store":
+        """Create a new (or open an existing) writable database and return a Store."""
+        s = cls(db_path)
+        s._conn.executescript(_CREATE_SCHEMA)
+        return s
 
-    def close(self):
-        self.connection.disconnect()
-        self.classifier = self.manpage = self.mapping = self.db = None
+    def close(self) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
-    def drop(self, confirm=False):
+    def drop(self, confirm: bool = False) -> None:
         if not confirm:
             return
 
-        logger.info("dropping mapping, manpage, collections")
-        self.mapping.drop()
-        self.manpage.drop()
+        logger.info("dropping mappings, parsed_manpages, manpages tables")
+        self._conn.executescript("""
+            DELETE FROM mappings;
+            DELETE FROM parsed_manpages;
+            DELETE FROM manpages;
+        """)
+        self._conn.commit()
 
-    def training_set(self):
-        for d in self.classifier.find():
-            yield ClassifierManpage.from_store(d)
+    def find_man_page(
+        self, name: str, distro: str | None = None, release: str | None = None
+    ) -> list[ParsedManpage]:
+        """Find a man page by name.
 
-    def __contains__(self, name):
-        c = self.mapping.count_documents({"src": name})
-        return c > 0
-
-    def __iter__(self):
-        for d in self.manpage.find():
-            yield ManPage.from_store(d)
-
-    def find_man_page(self, name):
-        """find a man page by its name, everything following the last dot (.) in name,
-        is taken as the section of the man page
+        An exact mapping takes precedence. When there is no exact mapping,
+        everything following the last dot (.) is taken as the man page section.
 
         we return the man page found with the highest score, and a list of
         suggestions that also matched the given name (only the first item
-        is prepopulated with the option data)"""
+        is prepopulated with the option data)
+
+        when distro and release are set, filter results to manpages whose
+        source starts with ``distro/release/``."""
         if name.endswith(".gz"):
-            logger.info("name ends with .gz, looking up an exact match by source")
-            d = self.manpage.find_one({"source": name})
-            if not d:
+            logger.debug("name ends with .gz, looking up an exact match by source")
+            row = self._conn.execute(
+                "SELECT * FROM parsed_manpages WHERE source = ?", (name,)
+            ).fetchone()
+            if not row:
                 raise errors.ProgramDoesNotExist(name)
-            m = ManPage.from_store(d)
-            logger.info("returning %s", m)
+            m = ParsedManpage.from_store(dict(row))
+            logger.debug("returning %s", m)
             return [m]
 
-        section = None
         orig_name = name
+        logger.debug("looking up manpage in mappings with src %r", name)
+        mapping_rows = self._conn.execute(
+            "SELECT dst, score FROM mappings WHERE src = ?", (name,)
+        ).fetchall()
 
-        # don't try to look for a section if it's . (source)
-        if name != ".":
-            splitted = name.rsplit(".", 1)
-            name = splitted[0]
-            if len(splitted) > 1:
-                section = splitted[1]
+        section = None
+        # Dotted command names (for example, ``systemd.exec``) are valid
+        # mapping keys. Only interpret a suffix as a section after the exact
+        # command lookup misses.
+        if not mapping_rows and name != ".":
+            head, separator, tail = name.rpartition(".")
+            if separator:
+                name, section = head, tail
+                logger.debug("looking up manpage in mappings with src %r", name)
+                mapping_rows = self._conn.execute(
+                    "SELECT dst, score FROM mappings WHERE src = ?", (name,)
+                ).fetchall()
 
-        logger.info("looking up manpage in mapping with src %r", name)
-        cursor = list(self.mapping.find({"src": name}))
-
-        count = len(cursor)
-        if count == 0:
-            logger.debug(f"count is {count}")
+        if not mapping_rows:
             raise errors.ProgramDoesNotExist(name)
 
-        dsts = {d["dst"]: d["score"] for d in cursor}
-        cursor = list(
-            self.manpage.find(
-                {"_id": {"$in": list(dsts.keys())}}, {"name": 1, "source": 1}
-            )
-        )
-        if len(list(cursor)) != len(dsts):
+        dsts = {row["dst"]: row["score"] for row in mapping_rows}
+
+        placeholders = ",".join("?" * len(dsts))
+        manpage_rows = self._conn.execute(
+            f"SELECT name, source FROM parsed_manpages WHERE source IN ({placeholders})",
+            list(dsts.keys()),
+        ).fetchall()
+
+        if len(manpage_rows) != len(dsts):
             logger.error(
-                "one of %r mappings is missing in manpage collection "
+                "one of %r mappings is missing in parsed_manpages table "
                 "(%d mappings, %d found)",
                 dsts,
                 len(dsts),
-                len(cursor),
+                len(manpage_rows),
             )
-        results = [(d.pop("_id"), ManPage.from_store_name_only(**d)) for d in cursor]
+
+        # Apply distro/release filter when requested
+        if distro is not None and release is not None:
+            prefix = f"{distro}/{release}/"
+            manpage_rows = [
+                row for row in manpage_rows if row["source"].startswith(prefix)
+            ]
+            if not manpage_rows:
+                raise errors.ProgramDoesNotExist(name)
+            # Rebuild dsts to only include filtered rows
+            dsts = {row["source"]: dsts[row["source"]] for row in manpage_rows}
+
+        results = [
+            (row["source"], ParsedManpage(source=row["source"], name=row["name"]))
+            for row in manpage_rows
+        ]
         results.sort(key=lambda x: dsts.get(x[0], 0), reverse=True)
-        logger.info("got %s", results)
+        logger.debug(
+            "found %d candidates: %s",
+            len(results),
+            [(src, m.name_section) for src, m in results],
+        )
+
         if section is not None:
             if len(results) > 1:
                 results.sort(
-                    key=lambda oid_m: oid_m[1].section == section, reverse=True
+                    key=lambda src_m: src_m[1].section == section, reverse=True
                 )
-                logger.info(r"sorting %r so %s is first", results, section)
+                logger.debug("sorted candidates so section %s is first", section)
             if results[0][1].section != section:
                 raise errors.ProgramDoesNotExist(orig_name)
-            results.extend(self._discover_manpage_suggestions(results[0][0], results))
+            results.extend(
+                self._discover_manpage_suggestions(
+                    results[0][0],
+                    results,
+                    distro=distro,
+                    release=release,
+                )
+            )
 
-        oid = results[0][0]
+        top_source = results[0][0]
         results = [x[1] for x in results]
-        results[0] = ManPage.from_store(self.manpage.find_one({"_id": oid}))
+        row = self._conn.execute(
+            "SELECT * FROM parsed_manpages WHERE source = ?", (top_source,)
+        ).fetchone()
+        results[0] = ParsedManpage.from_store(dict(row))
         return results
 
-    def _discover_manpage_suggestions(self, oid, existing):
+    def has_manpage_source(self, source: str) -> bool:
+        """Return whether *source* exists in parsed_manpages."""
+        row = self._conn.execute(
+            "SELECT 1 FROM parsed_manpages WHERE source = ? LIMIT 1", (source,)
+        ).fetchone()
+        return row is not None
+
+    def delete_manpage(self, source: str) -> bool:
+        """Delete a manpage and its mappings (via CASCADE) from the store.
+
+        Deleting from manpages cascades to parsed_manpages, which in turn
+        cascades to mappings.
+
+        Returns True if a row was deleted, False if the source was not found.
+        """
+        cur = self._conn.execute("DELETE FROM manpages WHERE source = ?", (source,))
+        if cur.rowcount:
+            self._conn.commit()
+            return True
+        return False
+
+    def known_sha256s(self) -> dict[str, str]:
+        """Return a mapping of source_gz_sha256 → source for all stored manpages.
+
+        Only includes rows that have both a sha256 and a matching parsed_manpages
+        entry.  When multiple sources share the same hash, an arbitrary one wins.
+        """
+        rows = self._conn.execute(
+            "SELECT m.source_gz_sha256, m.source FROM manpages m"
+            " JOIN parsed_manpages p ON p.source = m.source"
+            " WHERE m.source_gz_sha256 IS NOT NULL"
+        ).fetchall()
+        return {row["source_gz_sha256"]: row["source"] for row in rows}
+
+    def extractor_info_index(self) -> dict[str, tuple[str, ExtractionMeta]]:
+        """Return source -> (extractor, meta) for all parsed manpages."""
+        rows = self._conn.execute(
+            "SELECT source, extractor, extraction_meta FROM parsed_manpages"
+        ).fetchall()
+        result: dict[str, tuple[str, ExtractionMeta]] = {}
+        for row in rows:
+            meta_dict = json.loads(row["extraction_meta"] or "{}")
+            result[row["source"]] = (
+                row["extractor"] or "",
+                ExtractionMeta.model_validate(meta_dict),
+            )
+        return result
+
+    def counts(self) -> dict[str, int]:
+        """Return row counts for core tables."""
+        return {
+            "manpages": self._conn.execute(
+                "SELECT COUNT(*) FROM parsed_manpages"
+            ).fetchone()[0],
+            "mappings": self._conn.execute("SELECT COUNT(*) FROM mappings").fetchone()[
+                0
+            ],
+        }
+
+    def log_event(self, event: str, metadata: dict | None = None) -> None:
+        """Append an entry to the db_events log."""
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT INTO db_events(timestamp, event, metadata) VALUES (?, ?, ?)",
+            (ts, event, json.dumps(metadata or {})),
+        )
+        self._conn.commit()
+
+    def get_events(self, event: str | None = None, limit: int = 50) -> list[dict]:
+        """Return recent db_events, newest first.
+
+        If *event* is given, only rows matching that event type are returned.
+        """
+        if event:
+            rows = self._conn.execute(
+                "SELECT id, timestamp, event, metadata FROM db_events "
+                "WHERE event = ? ORDER BY id DESC LIMIT ?",
+                (event, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT id, timestamp, event, metadata FROM db_events "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "timestamp": r["timestamp"],
+                "event": r["event"],
+                "metadata": json.loads(r["metadata"]),
+            }
+            for r in rows
+        ]
+
+    def _discover_manpage_suggestions(
+        self,
+        source: str,
+        existing: list[tuple[str, ParsedManpage]],
+        distro: str | None = None,
+        release: str | None = None,
+    ) -> list[tuple[str, ParsedManpage]]:
         """find suggestions for a given man page
 
-        oid is the objectid of the man page in question,
-        existing is a list of (oid, man page) of suggestions that were
+        source is the source path of the man page in question,
+        existing is a list of (source, man page) of suggestions that were
         already discovered
         """
-        skip = {oid for oid, m in existing}
-        cursor = self.mapping.find({"dst": oid})
-        # find all srcs that point to oid
-        srcs = [d["src"] for d in cursor]
-        # find all dsts of srcs
-        suggestion_oids = self.mapping.find({"src": {"$in": srcs}}, {"dst": 1})
-        # remove already discovered
-        suggestion_oids = [d["dst"] for d in suggestion_oids if d["dst"] not in skip]
-        if not suggestion_oids:
+        skip = {src for src, m in existing}
+
+        # find all srcs that point to this source
+        src_rows = self._conn.execute(
+            "SELECT src FROM mappings WHERE dst = ?", (source,)
+        ).fetchall()
+        srcs = [row["src"] for row in src_rows]
+        if not srcs:
+            return []
+
+        # find all dsts of those srcs
+        placeholders = ",".join("?" * len(srcs))
+        dst_rows = self._conn.execute(
+            f"SELECT DISTINCT dst FROM mappings WHERE src IN ({placeholders})",
+            srcs,
+        ).fetchall()
+        suggestion_sources = [row["dst"] for row in dst_rows if row["dst"] not in skip]
+        if not suggestion_sources:
             return []
 
         # get just the name and source of found suggestions
-        suggestion_oids = self.manpage.find(
-            {"_id": {"$in": suggestion_oids}}, {"name": 1, "source": 1}
-        )
+        placeholders = ",".join("?" * len(suggestion_sources))
+        manpage_rows = self._conn.execute(
+            f"SELECT name, source FROM parsed_manpages WHERE source IN ({placeholders})",
+            suggestion_sources,
+        ).fetchall()
+
+        # Apply distro/release filter when requested
+        if distro is not None and release is not None:
+            prefix = f"{distro}/{release}/"
+            manpage_rows = [
+                row for row in manpage_rows if row["source"].startswith(prefix)
+            ]
+
         return [
-            (d.pop("_id"), ManPage.from_store_name_only(**d)) for d in suggestion_oids
+            (row["source"], ParsedManpage(source=row["source"], name=row["name"]))
+            for row in manpage_rows
         ]
 
-    def add_mapping(self, src, dst, score):
-        if not isinstance(dst, ObjectId):
-            dst = dst.inserted_id
-        self.mapping.insert_one({"src": src, "dst": dst, "score": score})
+    def distros(self) -> list[tuple[str, str]]:
+        """Return distinct (distro, release) pairs from manpages."""
+        rows = self._conn.execute("""
+            SELECT DISTINCT
+                SUBSTR(source, 1, INSTR(source, '/') - 1) as distro,
+                SUBSTR(source, INSTR(source, '/') + 1,
+                       INSTR(SUBSTR(source, INSTR(source, '/') + 1), '/') - 1) as release
+            FROM parsed_manpages
+        """).fetchall()
+        return [(row["distro"], row["release"]) for row in rows]
 
-    def add_manpage(self, m):
-        """add `m` into the store, if it exists first remove it and it's mappings
+    def distros_for_name(self, name: str) -> list[tuple[str, str]]:
+        """Return (distro, release) pairs that have a manpage matching *name*."""
+        rows = self._conn.execute(
+            """
+            SELECT DISTINCT
+                SUBSTR(pm.source, 1, INSTR(pm.source, '/') - 1) as distro,
+                SUBSTR(pm.source, INSTR(pm.source, '/') + 1,
+                       INSTR(SUBSTR(pm.source, INSTR(pm.source, '/') + 1), '/') - 1) as release
+            FROM mappings m
+            JOIN parsed_manpages pm ON pm.source = m.dst
+            WHERE m.src = ?
+            """,
+            (name,),
+        ).fetchall()
+        return [(row["distro"], row["release"]) for row in rows]
 
-        each man page may have aliases besides the name determined by it's
+    def add_mapping(self, src: str, dst: str, score: int) -> None:
+        self._conn.execute(
+            "INSERT INTO mappings(src, dst, score) VALUES (?, ?, ?)", (src, dst, score)
+        )
+        self._conn.commit()
+
+    def has_mapping(self, src: str, dst: str) -> bool:
+        """Return whether a mapping from *src* to *dst* already exists."""
+        row = self._conn.execute(
+            "SELECT 1 FROM mappings WHERE src = ? AND dst = ? LIMIT 1", (src, dst)
+        ).fetchone()
+        return row is not None
+
+    def mapping_score(self, src: str, dst: str) -> int | None:
+        """Return the score of the mapping from *src* to *dst*, or None."""
+        row = self._conn.execute(
+            "SELECT score FROM mappings WHERE src = ? AND dst = ? LIMIT 1", (src, dst)
+        ).fetchone()
+        return row["score"] if row else None
+
+    def update_mapping_score(self, src: str, dst: str, score: int) -> None:
+        """Update the score of an existing mapping."""
+        self._conn.execute(
+            "UPDATE mappings SET score = ? WHERE src = ? AND dst = ?",
+            (score, src, dst),
+        )
+        self._conn.commit()
+
+    def _upsert_raw_manpage(self, source: str, raw: RawManpage) -> None:
+        """Insert or replace a RawManpage into the manpages table."""
+        self._conn.execute(
+            """INSERT OR REPLACE INTO manpages(source, data, generated_at, generator,
+                                               generator_version, source_gz_sha256)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                source,
+                _compress(raw.source_text),
+                raw.generated_at.isoformat(),
+                raw.generator,
+                raw.generator_version,
+                raw.source_gz_sha256,
+            ),
+        )
+
+    def add_manpage(self, m: ParsedManpage, raw: RawManpage) -> ParsedManpage:
+        """add `m` into the store, if it exists first remove it and its mappings
+
+        each man page may have aliases besides the name determined by its
         basename"""
-        d = self.manpage.find_one({"source": m.source})
-        if d:
-            logger.info("removing old manpage %s (%s)", m.source, d["_id"])
-            self.manpage.delete_one({"_id": d["_id"]})
+        validate_source_path(m.source)
+        existing = self._conn.execute(
+            "SELECT source FROM parsed_manpages WHERE source = ?", (m.source,)
+        ).fetchone()
+        if existing:
+            logger.debug("removing old manpage %s", m.source)
+            # Non-alias mappings (e.g. symlink-derived) will be lost to the
+            # CASCADE delete, but are recreated automatically by the
+            # symlink/dedup mapping phase at the end of the run.
+            alias_srcs = {a for a, _ in m.aliases}
+            lost = [
+                row["src"]
+                for row in self._conn.execute(
+                    "SELECT src FROM mappings WHERE dst = ?", (m.source,)
+                ).fetchall()
+                if row["src"] not in alias_srcs
+            ]
+            if lost:
+                logger.debug(
+                    "re-importing %s will temporarily drop non-alias mappings: %s",
+                    m.source,
+                    ", ".join(sorted(lost)),
+                )
+            # ON DELETE CASCADE removes all mappings rows for this manpage.
+            self._conn.execute(
+                "DELETE FROM parsed_manpages WHERE source = ?", (m.source,)
+            )
+            self._conn.commit()
+            logger.debug("removed manpage and its mappings for %s", m.source)
+        else:
+            # Check for duplicate: same distro/release + name + section but different source
+            distro, release = config.parse_distro_release(m.source)
+            section = m.section
+            prefix = f"{distro}/{release}/"
+            conflict = self._conn.execute(
+                "SELECT source FROM parsed_manpages WHERE source LIKE ? AND source != ? AND name = ?",
+                (prefix + "%", m.source, m.name),
+            ).fetchone()
+            if conflict:
+                conflict_source = conflict["source"]
+                _, conflict_section = util.name_section(
+                    os.path.basename(conflict_source)[:-3]
+                )
+                if conflict_section == section:
+                    raise errors.DuplicateManpage(
+                        f"manpage {m.name}({section}) already exists with source "
+                        f"{conflict_source!r}, refusing to add duplicate from {m.source!r}"
+                    )
 
-            # remove old mappings if there are any
-            c = self.mapping.count_documents({})
-            self.mapping.delete_one({"dst": d["_id"]})
-            c -= self.mapping.count_documents({})
-            logger.info("removed %d mappings for manpage %s", c, m.source)
+        self._upsert_raw_manpage(m.source, raw)
 
-        o = self.manpage.insert_one(m.to_store())
+        self._conn.execute(
+            """INSERT INTO parsed_manpages(source, name, synopsis, options, aliases,
+                                   dashless_opts, subcommands, updated, nested_cmd,
+                                   extractor, extraction_meta)
+               VALUES (:source, :name, :synopsis, :options, :aliases,
+                       :dashless_opts, :subcommands, :updated, :nested_cmd,
+                       :extractor, :extraction_meta)""",
+            m.to_store(),
+        )
+        self._conn.commit()
 
         for alias, score in m.aliases:
-            self.add_mapping(alias, o, score)
-            logger.info(
-                "inserting mapping (alias) %s -> %s (%s) with score %d",
+            self._conn.execute(
+                "INSERT INTO mappings(src, dst, score) VALUES (?, ?, ?)",
+                (alias, m.source, score),
+            )
+            logger.debug(
+                "inserting mapping (alias) %s -> %s with score %d",
                 alias,
                 m.name,
-                o,
                 score,
             )
+
+        self._conn.commit()
         return m
 
-    def update_man_page(self, m):
-        """update m and add new aliases if necessary
+    def names(self) -> Iterator[tuple[str, str]]:
+        for row in self._conn.execute("SELECT source, name FROM parsed_manpages"):
+            yield row["source"], row["name"]
 
-        change updated attribute so we don't overwrite this in the future"""
-        logger.info("updating manpage %s", m.source)
-        m.updated = True
-        self.manpage.update_one({"source": m.source}, m.to_store())
-        _id = self.manpage.find_one({"source": m.source}, projection={"_id": 1})["_id"]
-        for alias, score in m.aliases:
-            if alias not in self:
-                self.add_mapping(alias, _id, score)
-                logger.info(
-                    "inserting mapping (alias) %s -> %s (%s) with score %d",
-                    alias,
-                    m.name,
-                    _id,
-                    score,
-                )
-            else:
-                logger.debug(
-                    "mapping (alias) %s -> %s (%s) already exists", alias, m.name, _id
-                )
-        return m
+    def mappings(self) -> Iterator[tuple[str, str]]:
+        for row in self._conn.execute("SELECT src, dst FROM mappings"):
+            yield row["src"], row["dst"]
 
-    def verify(self):
-        # check that everything in manpage is reachable
-        mappings = list(self.mapping.find())
-        reachable = {m["dst"] for m in mappings}
-        man_pages = {m["_id"] for m in self.manpage.find(projection={"_id": 1})}
+    def update_subcommand_mappings(self) -> SubcommandMappingResult:
+        """Reconcile subcommand mappings using declared subcommands from LLM-extracted pages.
 
-        ok = True
-        unreachable = man_pages - reachable
-        if unreachable:
-            logger.error(
-                "manpages %r are unreachable (nothing maps to them)", unreachable
-            )
-            unreachable = [
-                self.manpage.find_one({"_id": u})["name"] for u in unreachable
-            ]
-            ok = False
+        For each parent manpage that has a non-empty ``subcommands`` list,
+        find matching child manpages (hyphenated names like ``git-commit``)
+        in the same distro/release and create ``"git commit"`` → child mappings.
 
-        notfound = reachable - man_pages
-        if notfound:
-            logger.error("mappings to non-existing manpages: %r", notfound)
-            ok = False
+        This is a full reconciliation: all existing subcommand mappings
+        (``src LIKE '% %'``) are deleted first, then the correct set is
+        re-inserted.  This cleans up stale mappings left by prior runs
+        (e.g. a parent whose subcommands list shrank after re-extraction).
+        """
+        hyphenated: dict[str, list[str]] = {}  # full hyphenated name -> [source, ...]
+        # name -> [(source, subcommands), ...] — only non-empty subcommands
+        llm_parents: dict[str, list[tuple[str, list[str]]]] = {}
 
-        return ok, unreachable, notfound
+        rows = self._conn.execute(
+            "SELECT source, name, subcommands FROM parsed_manpages"
+        ).fetchall()
+        for row in rows:
+            name = row["name"]
+            source = row["source"]
+            subcommands = json.loads(row["subcommands"])
 
-    def names(self):
-        cursor = self.manpage.find({}, {"name": 1})
-        for d in cursor:
-            yield d["_id"], d["name"]
+            if subcommands:
+                llm_parents.setdefault(name, []).append((source, subcommands))
+            if "-" in name:
+                hyphenated.setdefault(name, []).append(source)
 
-    def mappings(self):
-        cursor = self.mapping.find({}, {"src": 1})
-        for d in cursor:
-            yield d["src"], d["_id"]
+        # Compute the full set of valid subcommand mappings.
+        valid_mappings: set[tuple[str, str]] = set()
+        parents: dict[str, str] = {}
 
-    def set_multi_cmd(self, manpage_id):
-        self.manpage.update_one({"_id": manpage_id}, {"$set": {"multi_cmd": True}})
+        for parent_name, parent_entries in llm_parents.items():
+            for parent_source, subcommands in parent_entries:
+                prefix = _dr_prefix(parent_source)
+                for sub in subcommands:
+                    child_name = f"{parent_name}-{sub}"
+                    for child_source in hyphenated.get(child_name, []):
+                        if not child_source.startswith(prefix):
+                            continue
+                        joined = f"{parent_name} {sub}"
+                        valid_mappings.add((joined, child_source))
+                        parents[parent_name] = parent_source
+
+        # Delete all existing subcommand mappings and re-insert the valid set
+        # in a single transaction. Keep canonical mappings for multiword
+        # manpage names (e.g. "pg_autoctl activate") only when they point to
+        # that manpage itself.
+        deleted = self._conn.execute(
+            "DELETE FROM mappings WHERE src LIKE '% %' "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM parsed_manpages "
+            "WHERE parsed_manpages.source = mappings.dst "
+            "AND parsed_manpages.name = mappings.src"
+            ")"
+        ).rowcount
+
+        mappings_to_add = sorted(valid_mappings)
+        self._conn.executemany(
+            "INSERT INTO mappings(src, dst, score) VALUES (?, ?, 1)",
+            [(src, dst) for src, dst in mappings_to_add],
+        )
+        self._conn.commit()
+
+        added = len(mappings_to_add)
+        logger.info(
+            "subcommand mapping reconciliation: %d removed, %d added (net %+d)",
+            deleted,
+            added,
+            added - deleted,
+        )
+
+        return SubcommandMappingResult(mappings_to_add, parents)
+
+    def list_sections(self, distro: str, release: str) -> list[str]:
+        """Return distinct section directories for a distro/release.
+
+        Extracts the third path component from source keys matching
+        ``distro/release/...`` using a range scan on the primary key.
+        """
+        prefix = f"{distro}/{release}/"
+        offset = len(prefix)
+        rows = self._conn.execute(
+            "SELECT DISTINCT SUBSTR(source, ?, INSTR(SUBSTR(source, ?), '/') - 1) AS section "
+            "FROM manpages WHERE source >= ? AND source < ? "
+            "ORDER BY section",
+            (offset + 1, offset + 1, prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)),
+        ).fetchall()
+        return [row["section"] for row in rows]
+
+    def list_manpages(self, prefix: str) -> list[str]:
+        """List source paths that start with *prefix*.
+
+        Uses a range scan on the ``manpages`` primary key index.
+        """
+        rows = self._conn.execute(
+            "SELECT source FROM manpages WHERE source >= ? AND source < ?",
+            (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)),
+        ).fetchall()
+        return [row["source"] for row in rows]
+
+    def get_raw_manpage(self, source: str) -> RawManpage | None:
+        """Fetch and decompress a raw manpage.
+
+        Returns a ``RawManpage`` or ``None`` if not stored.
+        """
+        row = self._conn.execute(
+            "SELECT data, generated_at, generator, generator_version, source_gz_sha256 "
+            "FROM manpages WHERE source = ?",
+            (source,),
+        ).fetchone()
+        if row is None:
+            return None
+        return RawManpage(
+            source_text=_decompress(row["data"]),
+            generated_at=datetime.datetime.fromisoformat(row["generated_at"]),
+            generator=row["generator"],
+            generator_version=row["generator_version"],
+            source_gz_sha256=row["source_gz_sha256"],
+        )

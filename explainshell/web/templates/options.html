@@ -8,7 +8,7 @@
             <div class="small-push"></div>
             <div class="push"></div>
             <div id="command" style="word-spacing: 0px;">
-                {% import 'macros.html' as macros %}
+                {% import 'macros.html' as macros with context %}
                 {{ macros.outputcommand(mp, suggestions) }}
             </div>
             <div class="small-push"></div>
@@ -18,11 +18,65 @@
                         {% for desc in mp.options -%}
                         <tr>
                             <td>
-                                <pre>{{ desc|safe }}</pre>
+                                <div class="help-box" id="option-{{ loop.index0 }}">{{ desc|safe }}</div>
                             </td>
                         </tr>
                         {%- endfor %}
                     </tbody>
                 </table>
             </div>
+{% if config.DEBUG and raw_mp %}
+            <div id="debug-panel" style="position: fixed; top: 10px; right: 10px; background: rgba(0,0,0,0.85); color: #0f0; font-family: monospace; font-size: 11px; padding: 10px 14px; border-radius: 6px; z-index: 9999; max-width: 400px; line-height: 1.6;">
+                <div style="font-weight: bold; margin-bottom: 4px; color: #ff0; font-size: 12px;">Debug: <span id="debug-kind">ParsedManpage</span></div>
+                <div id="debug-content">
+                    <div>source: {{ raw_mp.source }}</div>
+                    <div>name: {{ raw_mp.name }}</div>
+                    <div>section: {{ raw_mp.section }}</div>
+                    <div>extractor: {{ raw_mp.extractor or 'None' }}</div>
+                    <div>extraction_meta: {{ raw_mp.extraction_meta or '{}' }}</div>
+                    <div>aliases: {{ raw_mp.aliases }}</div>
+                    <div>dashless_opts: {{ raw_mp.dashless_opts }}</div>
+                    <div>subcommands: {{ raw_mp.subcommands }}</div>
+                    <div>nested_cmd: {{ raw_mp.nested_cmd }}</div>
+                    <div>updated: {{ raw_mp.updated }}</div>
+                    <div>options: {{ raw_mp.options|length }}</div>
+                </div>
+            </div>
+{% if debug_info %}
+            <script>
+            (function() {
+                var debugInfo = {{ debug_info|tojson }};
+                var panel = document.getElementById('debug-panel');
+                var kindEl = document.getElementById('debug-kind');
+                var content = document.getElementById('debug-content');
+                var defaultKind = kindEl.textContent;
+                var defaultContent = content.innerHTML;
+                var boxes = document.querySelectorAll('.help-box[id]');
+                boxes.forEach(function(box) {
+                    box.addEventListener('mouseenter', function() {
+                        var data = debugInfo[box.id];
+                        if (!data) return;
+                        var html = '';
+                        Object.keys(data).forEach(function(k) {
+                            html += '<div>' + k + ': ' + JSON.stringify(data[k]) + '</div>';
+                        });
+                        kindEl.textContent = data.kind || '?';
+                        content.innerHTML = html;
+                    });
+                    box.addEventListener('mouseleave', function() {
+                        kindEl.textContent = defaultKind;
+                        content.innerHTML = defaultContent;
+                    });
+                });
+            })();
+            </script>
+{% endif %}
+{% endif %}
 {% endblock %}
+{% block footer -%}
+{% if config.DEBUG and raw_mp %}
+<div class="push"></div><div class="text-center"><small>
+source manpage: <a href="/manpage/{{ raw_mp.source[:-3] }}">{{ raw_mp.source[:-3]|e }}</a>
+</small></div>
+{% endif %}
+{%- endblock %}

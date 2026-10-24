@@ -1,0 +1,104 @@
+{
+	auto_https off
+	admin off
+	persist_config off
+
+	# botshed isn't a builtin handler so caddy needs an explicit slot
+	# in the handler chain; "before reverse_proxy" puts it where the
+	# `handle` block expects it.
+	order botshed before reverse_proxy
+
+	# Trust the platform's private network so caddy preserves
+	# X-Forwarded-Proto/For/Host from the edge instead of overwriting them.
+	# Without this, caddy sets X-Forwarded-Proto=http (its own hop is
+	# plaintext), contradicting the edge's https value, and gunicorn rejects
+	# the request as InvalidSchemeHeaders. trusted_proxies_strict parses
+	# X-Forwarded-For right-to-left to resist spoofing from appending edges.
+	# client_ip_headers resolves request.client_ip in access logs to the
+	# real user IP. DO App Platform puts it in Do-Connecting-Ip; the
+	# Cloudflare fallback (CF-Connecting-IP) covers direct-origin probes
+	# if we ever front the app with our own CF. Caddy uses the first
+	# header in the list that's present.
+	servers {
+		# private_ranges covers RFC1918 + loopback but NOT CGNAT (100.64.0.0/10).
+		# DO App Platform's internal proxy hop uses CGNAT (e.g. 100.127.x.x),
+		# so without this addition trusted_proxies_strict refuses to read
+		# Do-Connecting-Ip and client_ip falls back to the proxy IP.
+		trusted_proxies static private_ranges 100.64.0.0/10
+		trusted_proxies_strict
+		client_ip_headers Do-Connecting-Ip CF-Connecting-IP
+	}
+}
+
+:8080 {
+	# Structured access log. Default caddy json is ~1.5 KB/line; this filter
+	# drops well-known noise (cookie, accept-*, sec-fetch-*, resp headers)
+	# to keep each line under ~400 bytes. client_ip + User-Agent + Cf-Ray
+	# are preserved for debugging and correlation with CF analytics.
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				resp_headers delete
+				bytes_read delete
+				user_id delete
+				request>remote_port delete
+				request>proto delete
+				request>headers>Accept delete
+				request>headers>Accept-Encoding delete
+				request>headers>Accept-Language delete
+				request>headers>Cookie delete
+				request>headers>Upgrade-Insecure-Requests delete
+				request>headers>Cache-Control delete
+				request>headers>Priority delete
+				request>headers>Dnt delete
+				request>headers>Te delete
+				request>headers>Connection delete
+				request>headers>Sec-Ch-Ua delete
+				request>headers>Sec-Ch-Ua-Mobile delete
+				request>headers>Sec-Ch-Ua-Platform delete
+				request>headers>Sec-Fetch-Dest delete
+				request>headers>Sec-Fetch-Mode delete
+				request>headers>Sec-Fetch-Site delete
+				request>headers>Sec-Fetch-User delete
+				request>headers>Via delete
+				request>headers>X-Forwarded-For delete
+				request>headers>X-Forwarded-Proto delete
+				request>headers>Cf-Connecting-Ip delete
+				request>headers>Do-Connecting-Ip delete
+				request>headers>Cdn-Loop delete
+			}
+		}
+	}
+
+	@assets path /static/* /favicon.ico
+	handle @assets {
+		root * /opt/webapp/explainshell/web
+		header Cache-Control "public, max-age=86400"
+		file_server
+	}
+
+	handle {
+		# Adds shed=true/false to /explain access logs (var set by botshed;
+		# empty elsewhere). Datadog metrics split organic vs bot on it.
+		# log_append's default directive order is before botshed's slot,
+		# which it must be: botshed short-circuits the chain when shedding.
+		log_append shed {vars.shed}
+		botshed {
+			db_path {env.DB_PATH}
+			upstream {env.UPSTREAM_ADDR}
+		}
+		reverse_proxy {env.UPSTREAM_ADDR} {
+			# 256 KB covers the ~67 KB worst-case explain response.
+			response_buffers 256KB
+			transport http {
+				# Per-read timeout, not a whole-request deadline.
+				read_timeout 10s
+				# Matches gunicorn's 2w × 4t = 8 slots. Queue for waiters
+				# is unbounded — wall clock cap lives above this layer.
+				max_conns_per_host 8
+			}
+		}
+	}
+}

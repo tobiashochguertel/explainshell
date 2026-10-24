@@ -1,63 +1,266 @@
-from explainshell import help_constants, matcher, store, errors, options
+import datetime
+import os
+
+from explainshell.models import Option, ParsedManpage, RawManpage
+from explainshell.store import Store
+
+TESTS_DIR = os.path.dirname(__file__)
+
+_NOW = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+_ROFF_RAW = RawManpage(
+    source_text=".TH roff content", generated_at=_NOW, generator="roff"
+)
+_MARKDOWN_RAW = RawManpage(
+    source_text="# markdown content", generated_at=_NOW, generator="mandoc -T markdown"
+)
 
 
-class MockStore:
-    def __init__(self):
-        sp = store.Paragraph
-        so = store.Option
-        sm = store.ManPage
+def create_test_store() -> Store:
+    """Build a real Store backed by in-memory SQLite with standard test fixtures."""
+    store = Store.create(":memory:")
 
-        p0 = sp(0, "-a desc", "", True)
-        p1 = sp(1, "-b <arg> desc", "", True)
-        p2 = sp(2, "-? help text", "", True)
-        p3 = sp(3, "-c=one,two\ndesc", "", True)
-        p4 = sp(4, "FILE argument", "", True)
-        p5 = sp(5, "-exec nest", "", True)
-        opts = [
-            so(p0, ["-a"], ["--a"], False),
-            so(p1, ["-b"], ["--b"], "<arg>"),
-            so(p2, ["-?"], [], False),
-            so(p3, ["-c"], [], ["one", "two"]),
-        ]
-        self.manpages = {
-            "bar": sm("bar.1.gz", "bar", "bar synopsis", opts, [], multi_cmd=True),
-            "baz": sm("baz.1.gz", "baz", "baz synopsis", opts, [], partial_match=True),
-            "bar foo": sm(
-                "bar-foo.1.gz",
-                "bar-foo",
-                "bar foo synopsis",
-                opts,
-                [],
-                partial_match=True,
-            ),
-            "nosynopsis": sm("bar.1.gz", "bar", None, opts, []),
-        }
+    opts = [
+        Option(text="-a desc", short=["-a"], long=["--a"], has_argument=False),
+        Option(text="-b <arg> desc", short=["-b"], long=["--b"], has_argument=True),
+        Option(text="-? help text", short=["-?"], long=[], has_argument=False),
+        Option(
+            text="-c=one,two\ndesc",
+            short=["-c"],
+            long=[],
+            has_argument=["one", "two"],
+        ),
+    ]
 
-        self.dup = [
-            sm("dup.1.gz", "dup", "dup1 synopsis", opts, []),
-            sm("dup.2.gz", "dup", "dup2 synopsis", opts, []),
-        ]
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/bar.1.gz",
+            name="bar",
+            synopsis="bar synopsis",
+            options=opts,
+            aliases=[("bar", 10)],
+            subcommands=["foo"],
+        ),
+        _ROFF_RAW,
+    )
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/baz.1.gz",
+            name="baz",
+            synopsis="baz synopsis",
+            options=opts,
+            aliases=[("baz", 10)],
+            dashless_opts=True,
+        ),
+        _ROFF_RAW,
+    )
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/bar-foo.1.gz",
+            name="bar-foo",
+            synopsis="bar foo synopsis",
+            options=opts,
+            aliases=[("bar foo", 10)],
+            dashless_opts=True,
+        ),
+        _ROFF_RAW,
+    )
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/nosynopsis.1.gz",
+            name="nosynopsis",
+            synopsis=None,
+            options=opts,
+            aliases=[("nosynopsis", 10)],
+        ),
+        _ROFF_RAW,
+    )
 
-        opts = list(opts)
-        opts.append(so(p4, [], [], False, "FILE"))
-        opts.append(so(p5, ["-exec"], [], True, nested_cmd=["EOF", ";"]))
-        self.manpages["withargs"] = sm(
-            "withargs.1.gz",
-            "withargs",
-            "withargs synopsis",
-            opts,
-            [],
-            partial_match=True,
-            nested_cmd=True,
+    # Two manpages with the same name but different sections (suggestions).
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/dup.1.gz",
+            name="dup",
+            synopsis="dup1 synopsis",
+            options=opts,
+            aliases=[("dup", 10)],
+        ),
+        _ROFF_RAW,
+    )
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/2/dup.2.gz",
+            name="dup",
+            synopsis="dup2 synopsis",
+            options=opts,
+            aliases=[("dup", 5)],
+        ),
+        _ROFF_RAW,
+    )
+
+    extended_opts = list(opts)
+    extended_opts.append(
+        Option(
+            text="FILE argument",
+            short=[],
+            long=[],
+            has_argument=False,
+            positional="FILE",
         )
+    )
+    extended_opts.append(
+        Option(
+            text="-exec nest",
+            short=["-exec"],
+            long=[],
+            has_argument=True,
+            nested_cmd=["EOF", ";"],
+        )
+    )
 
-    def find_man_page(self, x, section=None):
-        try:
-            if x == "dup":
-                return self.dup
-            return [self.manpages[x]]
-        except KeyError:
-            raise errors.ProgramDoesNotExist(x)
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/markdown-page.1.gz",
+            name="markdown-page",
+            synopsis="page with markdown source",
+            options=extended_opts,
+            aliases=[("markdown-page", 10)],
+        ),
+        _MARKDOWN_RAW,
+    )
+
+    # Edge-case filenames.
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/cd.1posix.gz",
+            name="cd",
+            synopsis="change directory",
+            options=[],
+            aliases=[("cd", 10)],
+        ),
+        _ROFF_RAW,
+    )
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/pg_autoctl create worker.1.gz",
+            name="pg_autoctl create worker",
+            synopsis="create a worker",
+            options=[],
+            aliases=[("pg_autoctl create worker", 10)],
+        ),
+        _ROFF_RAW,
+    )
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/c++filt.1.gz",
+            name="c++filt",
+            synopsis="demangle symbols",
+            options=[],
+            aliases=[("c++filt", 10)],
+        ),
+        _ROFF_RAW,
+    )
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/withargs.1.gz",
+            name="withargs",
+            synopsis="withargs synopsis",
+            options=extended_opts,
+            aliases=[("withargs", 10)],
+            dashless_opts=True,
+            nested_cmd=True,
+        ),
+        _ROFF_RAW,
+    )
+
+    multipos_opts = list(opts)
+    multipos_opts.append(
+        Option(
+            text="source file(s) to copy",
+            short=[],
+            long=[],
+            has_argument=False,
+            positional="SOURCE",
+        )
+    )
+    multipos_opts.append(
+        Option(
+            text="destination path",
+            short=[],
+            long=[],
+            has_argument=False,
+            positional="DEST",
+        )
+    )
+
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/withmultipos.1.gz",
+            name="withmultipos",
+            synopsis="withmultipos synopsis",
+            options=multipos_opts,
+            aliases=[("withmultipos", 10)],
+        ),
+        _ROFF_RAW,
+    )
+
+    # dig-like page: a prefixed positional ('@server') plus ordered ones.
+    prefixpos_opts = [
+        Option(
+            text="server to query",
+            short=[],
+            long=[],
+            has_argument=False,
+            positional="server",
+            prefix="@",
+        ),
+        Option(
+            text="name of the resource record",
+            short=[],
+            long=[],
+            has_argument=False,
+            positional="name",
+        ),
+        Option(
+            text="query type",
+            short=[],
+            long=[],
+            has_argument=False,
+            positional="type",
+        ),
+    ]
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/withprefixpos.1.gz",
+            name="withprefixpos",
+            synopsis="withprefixpos synopsis",
+            options=prefixpos_opts,
+            aliases=[("withprefixpos", 10)],
+        ),
+        _ROFF_RAW,
+    )
+
+    # page whose ONLY positional is prefix-bearing.
+    store.add_manpage(
+        ParsedManpage(
+            source="ubuntu/26.04/1/onlyprefixpos.1.gz",
+            name="onlyprefixpos",
+            synopsis="onlyprefixpos synopsis",
+            options=[
+                Option(
+                    text="display to use",
+                    short=[],
+                    long=[],
+                    has_argument=False,
+                    positional="display",
+                    prefix=":",
+                )
+            ],
+            aliases=[("onlyprefixpos", 10)],
+        ),
+        _ROFF_RAW,
+    )
+
+    return store
 
 
-s = MockStore()
+s = create_test_store()

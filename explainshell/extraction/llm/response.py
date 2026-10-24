@@ -1,0 +1,297 @@
+"""JSON parsing, validation, option conversion, and chunk-level dedup."""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+
+from explainshell import models
+from explainshell.errors import ExtractionError, FailureReason
+
+logger = logging.getLogger(__name__)
+
+
+def normalize_subcommands(basename: str, raw: list[str]) -> list[str]:
+    """Strip parent-name prefix and deduplicate subcommand names.
+
+    LLMs sometimes return ``["git-add", "git-commit"]`` instead of
+    ``["add", "commit"]``.  This strips the ``{basename}-`` prefix when
+    present and deduplicates while preserving order.
+    """
+    prefix = f"{basename}-"
+    stripped = [s.removeprefix(prefix) for s in raw]
+    return list(dict.fromkeys(stripped))
+
+
+def fix_invalid_escapes(s: str) -> str:
+    """Replace invalid JSON escape sequences with their escaped form.
+
+    JSON only allows: \\", \\\\, \\/, \\b, \\f, \\n, \\r, \\t, \\uXXXX.
+    LLMs sometimes produce things like \\p or \\a which are invalid.
+    """
+    return re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", s)
+
+
+def parse_json_response(content: str) -> dict:
+    """Strip markdown fences, find outermost {…}, parse JSON."""
+    content = re.sub(r"^```[^\n]*\n?", "", content.strip())
+    content = re.sub(r"\n?```$", "", content.strip())
+
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ExtractionError(
+            f"No JSON object found in LLM response: {content[:200]!r}",
+            raw_response=content,
+            reason_class=FailureReason.INVALID_RESPONSE,
+        )
+
+    raw = content[start : end + 1]
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        return json.loads(fix_invalid_escapes(raw))
+    except json.JSONDecodeError as e:
+        raise ExtractionError(
+            f"Invalid JSON from LLM: {e}",
+            raw_response=content,
+            reason_class=FailureReason.INVALID_JSON,
+        ) from e
+
+
+def validate_llm_response(data: dict) -> None:
+    """Raises ValueError if data is missing 'options' or options have wrong types."""
+    if "options" not in data:
+        raise ValueError("LLM response missing 'options' key")
+    # These stay ValueError rather than TypeError: they describe a malformed
+    # LLM payload, and callers convert ValueError into ExtractionError.
+    if not isinstance(data["options"], list):
+        raise ValueError("'options' must be a list")  # noqa: TRY004
+    for item in data["options"]:
+        if not isinstance(item, dict):
+            raise ValueError(  # noqa: TRY004
+                f"Each option must be a dict, got {type(item)}"
+            )
+
+
+def process_llm_result(content: str) -> tuple[dict, str]:
+    """Parse and validate a raw LLM response string.
+
+    Returns (data_dict, raw_content).
+    Raises ExtractionError on parse failure or validation failure.
+    """
+    data = parse_json_response(content)
+    try:
+        validate_llm_response(data)
+    except ValueError as e:
+        raise ExtractionError(
+            str(e),
+            raw_response=content,
+            reason_class=FailureReason.INVALID_SCHEMA,
+        ) from e
+    return data, content
+
+
+def extract_text_from_lines(
+    original_lines: dict[int, str], start: int, end: int
+) -> str:
+    """Build description text from line range [start, end] (1-indexed, inclusive).
+
+    The first line is treated as the flag line. Remaining lines form the
+    description body. Blockquote prefixes ("> ") are stripped from all lines.
+    """
+    if start < 1 or end < start:
+        return ""
+    selected: list[str] = []
+    for i in range(start, end + 1):
+        line = original_lines.get(i, "")
+        line = line.removeprefix("> ")
+        selected.append(line)
+
+    if not selected:
+        return ""
+
+    flag_line = selected[0]
+    body_lines = selected[1:]
+
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+
+    if body_lines:
+        return flag_line + "\n\n" + "\n".join(body_lines)
+    return flag_line
+
+
+def normalize_option_fields(raw: dict) -> dict:
+    """Normalize known LLM type mistakes in a raw option dict before validation.
+
+    Fixes observed in the top-1000 corpus run:
+    - ``has_argument: null`` → ``False`` (8 positional-arg options)
+    - ``has_argument`` list with int elements → stringified (hdparm --set-sector-size)
+    - ``has_argument`` bare string (e.g. ``"1..99"``) → ``True`` (avrdude range params)
+    - sigil embedded in the positional name (``"positional": "@server"``) →
+      split into ``prefix`` + bare name; only for allowlisted sigil characters,
+      so placeholder styling like ``<FILE>`` is untouched
+    """
+    raw = dict(raw)  # shallow copy to avoid mutating caller's data
+
+    if raw.get("has_argument") is None and "has_argument" in raw:
+        raw["has_argument"] = False
+
+    # Normalize list elements to str (LLM sometimes returns ints for enum values).
+    ha = raw.get("has_argument")
+    if isinstance(ha, list) and ha and not all(isinstance(x, str) for x in ha):
+        raw["has_argument"] = [str(x) for x in ha]
+
+    # Coerce bare strings (e.g. range expressions like "0..7") to True.
+    if isinstance(ha, str):
+        raw["has_argument"] = True
+
+    # Strip a leading sigil from the positional name into prefix.
+    pos = raw.get("positional")
+    if (
+        isinstance(pos, str)
+        and len(pos) > 1
+        and pos[0] in models.OPTION_PREFIX_SIGILS
+        and not raw.get("prefix")
+    ):
+        raw["prefix"] = pos[0]
+        raw["positional"] = pos[1:]
+
+    return raw
+
+
+def sanitize_option_fields(
+    short: list[str],
+    long: list[str],
+    has_argument: bool | list[str],
+    positional: str | None,
+    nested_cmd: bool,
+    prefix: str | None = None,
+) -> tuple[list[str], list[str], bool | list[str], str | None, bool, str | None]:
+    """Fix common LLM mistakes in option fields.
+
+    Returns (short, long, has_argument, positional, nested_cmd, prefix).
+    """
+    if positional and (short or long):
+        logger.debug(
+            "clearing positional=%r on flagged option %s/%s", positional, short, long
+        )
+        positional = None
+
+    if prefix and not positional:
+        logger.debug("clearing prefix=%r on non-positional option", prefix)
+        prefix = None
+
+    if prefix and prefix not in models.OPTION_PREFIX_SIGILS:
+        logger.debug(
+            "dropping prefix=%r on positional %r: not in sigil allowlist",
+            prefix,
+            positional,
+        )
+        prefix = None
+
+    if nested_cmd and not has_argument:
+        has_argument = True
+
+    return short, long, has_argument, positional, nested_cmd, prefix
+
+
+def llm_option_to_store_option(
+    raw: dict, original_lines: dict[int, str]
+) -> models.Option:
+    """Convert one LLM option dict to a models.Option.
+
+    Uses the "lines" field to slice the description from original_lines.
+    """
+    raw = normalize_option_fields(raw)
+    short = raw.get("short") or []
+    long = raw.get("long") or []
+    has_argument = raw.get("has_argument", False)
+    positional = raw.get("positional") or None
+    prefix = raw.get("prefix") or None
+    nested_cmd = bool(raw.get("nested_cmd", False))
+
+    if not isinstance(short, list):
+        raise ValueError(f"'short' must be a list, got {type(short)}")  # noqa: TRY004
+    if not isinstance(long, list):
+        raise ValueError(f"'long' must be a list, got {type(long)}")  # noqa: TRY004
+
+    lines = raw.get("lines")
+    if not lines or not isinstance(lines, list) or len(lines) != 2:
+        raise ValueError(f"'lines' must be a [start, end] list, got {lines!r}")
+    start, end = int(lines[0]), int(lines[1])
+    text = extract_text_from_lines(original_lines, start, end)
+
+    short, long, has_argument, positional, nested_cmd, prefix = sanitize_option_fields(
+        short, long, has_argument, positional, nested_cmd, prefix
+    )
+
+    return models.Option(
+        text=text,
+        short=short,
+        long=long,
+        has_argument=has_argument,
+        positional=positional,
+        prefix=prefix,
+        nested_cmd=nested_cmd,
+        meta={"lines": [start, end]},
+    )
+
+
+def dedup_options(raw_options: list[dict]) -> list[dict]:
+    """Remove options with duplicate (short+long) flag sets (from chunk overlap).
+
+    When duplicates exist, keep the entry with the longest description so that
+    detailed sections win over brief summary entries.
+    """
+    best: dict[tuple, tuple[int, dict]] = {}
+    positional: list[tuple[int, dict]] = []
+    for idx, opt in enumerate(raw_options):
+        try:
+            raw_short = opt.get("short") or []
+            raw_long = opt.get("long") or []
+            if not isinstance(raw_short, list) or not isinstance(raw_long, list):
+                positional.append((idx, opt))
+                continue
+            short = tuple(sorted(str(s) for s in raw_short))
+            long = tuple(sorted(str(s) for s in raw_long))
+        except (TypeError, AttributeError):
+            positional.append((idx, opt))
+            continue
+        key = (short, long)
+        if not short and not long:
+            positional.append((idx, opt))
+            continue
+        prev = best.get(key)
+        if prev is None:
+            best[key] = (idx, opt)
+        else:
+            old_desc = len(prev[1].get("description") or "")
+            new_desc = len(opt.get("description") or "")
+            if new_desc > old_desc:
+                best[key] = (idx, opt)
+    all_entries = list(best.values()) + positional
+    all_entries.sort(key=lambda x: x[0])
+    return [opt for _, opt in all_entries]
+
+
+def dedup_ref_options(raw_options: list[dict]) -> list[dict]:
+    """Dedup options using synthetic description length based on line span.
+
+    This wraps dedup_options by injecting a synthetic "description" key
+    so that the longest-span entry wins during dedup.
+    """
+    for opt in raw_options:
+        lines = opt.get("lines")
+        if lines and isinstance(lines, list) and len(lines) == 2:
+            opt["description"] = "x" * (int(lines[1]) - int(lines[0]) + 1)
+        elif "description" not in opt:
+            opt["description"] = ""
+    return dedup_options(raw_options)

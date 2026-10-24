@@ -1,0 +1,333 @@
+"""Text preparation for LLM extraction: mandoc → markdown, section filtering,
+line numbering, and chunking."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+
+from explainshell import config
+from explainshell.errors import ExtractionError, FailureReason
+
+# 60K chars ≈ 15-20K tokens. This is deliberately conservative: benchmarking at
+# 100K showed that pages fitting in one larger chunk (e.g. avrdude at 68K chars)
+# lost dozens of dashless/positional options buried deep in the text ("lost in
+# the middle" effect).  At 60K only ~2% of section-1 manpages need multi-chunk
+# splitting, and the cross-chunk dedup handles those well.
+CHUNK_SIZE_CHARS = 60_000
+MAX_MANPAGE_CHARS = 500_000
+
+# Top-level sections that almost never contain option documentation.
+_BLACKLISTED_SECTIONS = frozenset(
+    s.upper()
+    for s in [
+        "AUTHOR",
+        "AUTHORS",
+        "AVAILABILITY",
+        "BUGS",
+        "COLOPHON",
+        "COPYING",
+        "COPYRIGHT",
+        "COPYRIGHT AND LICENSE",
+        "ENVIRONMENT",
+        "ENVIRONMENT VARIABLES",
+        "EXIT STATUS",
+        "HISTORY",
+        "LICENSE",
+        "REPORTING BUGS",
+        "SEE ALSO",
+        "VERSION",
+    ]
+)
+
+
+def get_manpage_text(gz_path: str) -> str:
+    """Run patched ``mandoc -T markdown <gz_path>`` to get markdown directly."""
+    if not os.path.isfile(gz_path):
+        raise FileNotFoundError(f"manpage file not found: {gz_path}")
+    result = subprocess.run(
+        [config.MANDOC_PATH, "-T", "markdown", gz_path],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ExtractionError(
+            f"mandoc failed for {gz_path}: {result.stderr}",
+            reason_class=FailureReason.MANDOC_FAILED,
+        )
+    return result.stdout.strip()
+
+
+def _split_sections(text: str) -> list[tuple[int, str]]:
+    """Split text into sections at markdown header lines (# or ##).
+
+    Returns a list of (start_line, section_text) tuples where start_line
+    is the 1-indexed line number of the first line in the section.
+    """
+    lines = text.split("\n")
+    sections: list[tuple[int, str]] = []
+    current_start = 1
+    current_lines: list[str] = []
+
+    for i, line in enumerate(lines):
+        if re.match(r"^#{1,2} ", line) and current_lines:
+            sections.append((current_start, "\n".join(current_lines)))
+            current_start = i + 1
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append((current_start, "\n".join(current_lines)))
+
+    return sections
+
+
+def clean_mandoc_artifacts(text: str) -> str:
+    """Normalize HTML entities mandoc -T markdown emits.
+
+    `&nbsp;` becomes a plain space — its non-breaking semantics aren't needed
+    downstream and ASCII whitespace is friendlier to the LLM.
+
+    `&zwnj;` is preserved. mandoc inserts it between abutting bold/italic
+    emphasis spans (`**foo**&zwnj;*bar*`) so CommonMark's delimiter-run
+    flanking rules see the `;` (ASCII punctuation) and parse the runs as
+    separate spans. Stripping it produced patterns like
+    `**--config-file=*****file*` in stored option text, which CommonMark
+    folds into garbled emphasis.
+
+    The choice of `&zwnj;` is unusual industry-wide — Pandoc and Pod::Markdown
+    take different routes (Pandoc emits no separator; Pod::Markdown uses `_`
+    for italic to avoid collisions). Both alternatives fail for our corpus:
+    Pandoc's "trust CommonMark rule-of-3" misparses the
+    `**flag**+arg-name` pattern that mandoc-emitted man pages produce
+    constantly; Pod::Markdown's `_` italic breaks intraword italic
+    (`_N_th` → literal underscores) which is rampant in real man pages
+    (ffmpeg.1, git.1, tar.1, ...). mandoc's `&zwnj;` happens to dodge both
+    pitfalls for our specific consumer (cmarkgfm + LLM).
+    """
+    return text.replace("&nbsp;", " ")
+
+
+def filter_sections(text: str) -> tuple[str, dict[str, int]]:
+    """Remove blacklisted top-level sections from manpage text.
+
+    Returns (filtered_text, removal_counts).
+    """
+    sections = _split_sections(text)
+    kept: list[str] = []
+    removal_counts: dict[str, int] = {}
+    skip_until_top = False
+
+    for _start, section_text in sections:
+        header_line = section_text.split("\n", 1)[0].strip()
+
+        is_top_level = header_line.startswith("# ") and not header_line.startswith(
+            "## "
+        )
+
+        if is_top_level:
+            heading_name = header_line.split(" ", 1)[1].strip().upper()
+            if heading_name in _BLACKLISTED_SECTIONS:
+                removal_counts[heading_name] = removal_counts.get(heading_name, 0) + 1
+                skip_until_top = True
+                continue
+            else:
+                skip_until_top = False
+
+        if skip_until_top:
+            continue
+
+        kept.append(section_text)
+
+    return "\n".join(kept), removal_counts
+
+
+_MAX_PREAMBLE_CHARS = CHUNK_SIZE_CHARS // 2
+
+# Worst-case budget per chunk is CHUNK_SIZE_CHARS - _MAX_PREAMBLE_CHARS (when
+# the preamble is at its cap).  Any chunk count beyond this ratio for a
+# MAX_MANPAGE_CHARS-sized page is a sign of pathological splitting, not a
+# legitimately large manpage.
+MAX_CHUNKS = MAX_MANPAGE_CHARS // (CHUNK_SIZE_CHARS - _MAX_PREAMBLE_CHARS)  # 16
+
+
+def _build_preamble(text: str) -> str:
+    """Extract NAME + SYNOPSIS + first paragraph of DESCRIPTION as preamble.
+
+    The result is capped at ``_MAX_PREAMBLE_CHARS`` so the chunk budget never
+    goes negative (which would produce one chunk per line).
+    """
+    sections = _split_sections(text)
+    preamble_headers = {"# NAME", "# SYNOPSIS", "# DESCRIPTION"}
+    parts: list[str] = []
+    for _start, section_text in sections:
+        header_line = section_text.split("\n", 1)[0].strip()
+        if header_line in preamble_headers:
+            if header_line == "# DESCRIPTION":
+                paras = section_text.split("\n\n", 2)
+                parts.append("\n\n".join(paras[:2]))
+            else:
+                parts.append(section_text)
+    preamble = "\n\n".join(parts)
+    if len(preamble) > _MAX_PREAMBLE_CHARS:
+        preamble = preamble[:_MAX_PREAMBLE_CHARS].rsplit("\n", 1)[0] + "\n[…truncated]"
+    return preamble
+
+
+def number_lines(text: str) -> tuple[str, dict[int, str]]:
+    """Add line numbers to every line of text.
+
+    Returns (numbered_text, original_lines) where original_lines is a
+    dict mapping 1-indexed line numbers to their original content.
+    """
+    lines = text.split("\n")
+    original_lines: dict[int, str] = {}
+    numbered: list[str] = []
+    width = len(str(len(lines)))
+    for i, line in enumerate(lines, 1):
+        original_lines[i] = line
+        numbered.append(f"{i:>{width}}| {line}")
+    return "\n".join(numbered), original_lines
+
+
+_BARE_HEADING_RE = re.compile(r"^\s*\d+\|\s*\*\*[-+]")
+
+
+def _is_bare_option_heading(numbered_block: str) -> bool:
+    """True when a block is an option heading with no description of its own.
+
+    Such a block must not be left at the end of a chunk: the model is told to
+    extract only from an option's defining documentation, so a heading split
+    from its body is dropped by both the chunk that holds the heading and the
+    one that holds the body.
+    """
+    lines = [ln for ln in numbered_block.splitlines() if ln.strip()]
+    return len(lines) == 1 and bool(_BARE_HEADING_RE.match(lines[0]))
+
+
+def _is_bare_option_heading_raw(paragraph: str) -> bool:
+    """Same as :func:`_is_bare_option_heading` for un-numbered paragraph text."""
+    lines = [ln for ln in paragraph.splitlines() if ln.strip()]
+    return len(lines) == 1 and lines[0].lstrip().startswith(("**-", "**+"))
+
+
+def chunk_text(text: str) -> list[str]:
+    """Split text into numbered chunks at section boundaries.
+
+    Each chunk gets line numbers corresponding to the original text.
+    If the text is small enough, returns a single chunk.
+    A preamble (NAME/SYNOPSIS/DESCRIPTION intro) is prepended to each
+    chunk beyond the first so the model has context.
+
+    When a single section exceeds the chunk size, it is sub-split at
+    paragraph (blank-line) boundaries.
+    """
+    numbered_full, _ = number_lines(text)
+    if len(numbered_full) <= CHUNK_SIZE_CHARS:
+        return [numbered_full]
+
+    sections = _split_sections(text)
+    preamble = _build_preamble(text)
+    preamble_text = ""
+    if preamble:
+        preamble_text = (
+            "[Context — this is a continuation of the same man page]\n\n"
+            + preamble
+            + "\n\n---\n\n"
+        )
+    budget = CHUNK_SIZE_CHARS - len(preamble_text)
+
+    total_lines = text.count("\n") + 1
+    width = len(str(total_lines))
+
+    def _number_block(start_line: int, block_text: str) -> str:
+        lines = block_text.split("\n")
+        numbered = []
+        for j, line in enumerate(lines):
+            lineno = start_line + j
+            numbered.append(f"{lineno:>{width}}| {line}")
+        return "\n".join(numbered)
+
+    def _split_by_lines(start_line: int, block_text: str) -> list[tuple[int, str]]:
+        """Last-resort split: cut at line boundaries to fit budget."""
+        lines = block_text.split("\n")
+        result: list[tuple[int, str]] = []
+        cur_lines: list[str] = []
+        cur_start = start_line
+        for line in lines:
+            candidate = "\n".join(cur_lines + [line])
+            if len(_number_block(cur_start, candidate)) > budget and cur_lines:
+                result.append((cur_start, "\n".join(cur_lines)))
+                cur_start += len(cur_lines)
+                cur_lines = []
+            cur_lines.append(line)
+        if cur_lines:
+            result.append((cur_start, "\n".join(cur_lines)))
+        return result
+
+    blocks: list[tuple[int, str]] = []
+    for start_line, section_text in sections:
+        numbered = _number_block(start_line, section_text)
+        if len(numbered) <= budget:
+            blocks.append((start_line, section_text))
+        else:
+            paragraphs = section_text.split("\n\n")
+            cur_paras: list[str] = []
+            cur_start = start_line
+            for para in paragraphs:
+                candidate = "\n\n".join(cur_paras + [para])
+                numbered_candidate = _number_block(cur_start, candidate)
+                if len(numbered_candidate) > budget and cur_paras:
+                    carried: list[str] = []
+                    while len(cur_paras) > 1 and _is_bare_option_heading_raw(
+                        cur_paras[-1]
+                    ):
+                        carried.insert(0, cur_paras.pop())
+                    emitted = "\n\n".join(cur_paras)
+                    blocks.append((cur_start, emitted))
+                    cur_start = cur_start + emitted.count("\n") + 2
+                    cur_paras = carried
+                cur_paras.append(para)
+            if cur_paras:
+                blocks.append((cur_start, "\n\n".join(cur_paras)))
+
+    final_blocks: list[tuple[int, str]] = []
+    for start_line, block_text in blocks:
+        if len(_number_block(start_line, block_text)) > budget:
+            final_blocks.extend(_split_by_lines(start_line, block_text))
+        else:
+            final_blocks.append((start_line, block_text))
+    blocks = final_blocks
+
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_len = 0
+
+    for start_line, block_text in blocks:
+        numbered_block = _number_block(start_line, block_text)
+        block_len = len(numbered_block) + 1
+
+        if current_len + block_len > budget and current_parts:
+            carried: list[str] = []
+            while current_parts and _is_bare_option_heading(current_parts[-1]):
+                carried.insert(0, current_parts.pop())
+            if current_parts:
+                chunks.append("\n".join(current_parts))
+            current_parts = carried
+            current_len = sum(len(c) + 1 for c in carried)
+
+        current_parts.append(numbered_block)
+        current_len += block_len
+
+    if current_parts:
+        chunks.append("\n".join(current_parts))
+
+    if len(chunks) > 1 and preamble_text:
+        for i in range(1, len(chunks)):
+            chunks[i] = preamble_text + chunks[i]
+
+    return chunks

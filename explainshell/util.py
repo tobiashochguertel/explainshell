@@ -1,42 +1,11 @@
+import glob
 import itertools
+import os
+import subprocess
 from operator import itemgetter
 
 
-def consecutive(ln, fn):
-    """yield consecutive items from l that fn returns True for them
-
-    >>> even = lambda x: x % 2 == 0
-    >>> list(consecutive([], even))
-    []
-    >>> list(consecutive([1], even))
-    [[1]]
-    >>> list(consecutive([1, 2], even))
-    [[1], [2]]
-    >>> list(consecutive([2, 4], even))
-    [[2, 4]]
-    >>> list(consecutive([1, 2, 4], even))
-    [[1], [2, 4]]
-    >>> list(consecutive([1, 2, 4, 5, 7, 8, 10], even))
-    [[1], [2, 4], [5], [7], [8, 10]]
-    """
-    it = iter(ln)
-    ll = []
-    try:
-        while True:
-            x = next(it)
-            if fn(x):
-                ll.append(x)
-            else:
-                if ll:
-                    yield ll
-                    ll = []
-                yield [x]
-    except StopIteration:
-        if ll:
-            yield ll
-
-
-def group_continuous(l, key=None):
+def group_continuous(items, key=None):
     """
     >>> list(group_continuous([1, 2, 4, 5, 7, 8, 10]))
     [[1, 2], [4, 5], [7, 8], [10]]
@@ -44,42 +13,17 @@ def group_continuous(l, key=None):
     [[0, 1, 2, 3, 4]]
     """
     if key is None:
-        key = lambda x: x
-    for k, g in itertools.groupby(enumerate(l), lambda ix: ix[0] - key(ix[1])):
-        yield list(map(itemgetter(1), g))
 
+        def identity(value):
+            return value
 
-def topo_sorted(graph, parents):
-    """
-    Returns vertices of a DAG in topological order.
-
-    Arguments:
-    graph -- vertices of a graph to be topo_sorted
-    parents -- function (vertex) -> vertices to proceed
-               given vertex in output
-    """
-    result = []
-    used = set()
-
-    def use(v, top):
-        if id(v) in used:
-            return
-        for parent in parents(v):
-            if parent is top:
-                raise ValueError("graph is cyclical", graph)
-            use(parent, v)
-        used.add(id(v))
-        result.append(v)
-
-    for v in graph:
-        use(v, v)
-    return result
-
-
-def pairwise(iterable):
-    a, b = itertools.tee(iterable)
-    next(b, None)
-    return zip(a, b)
+        key_func = identity
+    else:
+        key_func = key
+    for _, grouped in itertools.groupby(
+        enumerate(items), lambda ix: ix[0] - key_func(ix[1])
+    ):
+        yield list(map(itemgetter(1), grouped))
 
 
 class Peekable:
@@ -146,15 +90,78 @@ def name_section(path):
     return name, section
 
 
-class PropertyCache:
-    def __init__(self, func):
-        self.func = func
-        self.name = func.__name__
+def _expand_file_lists(paths: list[str]) -> list[str]:
+    """Expand @file references to their contents.
 
-    def __get__(self, obj, type=None):
-        result = self.func(obj)
-        self.cache_value(obj, result)
-        return result
+    A path starting with '@' is treated as a file containing one path per line.
+    Blank lines and lines starting with '#' are skipped.
+    """
+    result: list[str] = []
+    for path in paths:
+        if path.startswith("@"):
+            list_file = path[1:]
+            with open(list_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        result.append(line)
+        else:
+            result.append(path)
+    return result
 
-    def cache_value(self, obj, value):
-        setattr(obj, self.name, value)
+
+def collect_gz_files(paths: list[str]) -> list[str]:
+    """Expand a list of files/directories into absolute .gz file paths.
+
+    Paths starting with '@' are treated as files containing one path per line.
+    """
+    expanded = _expand_file_lists(paths)
+    result: list[str] = []
+    for path in expanded:
+        if os.path.isdir(path):
+            result.extend(
+                sorted(glob.glob(os.path.join(path, "**", "*.gz"), recursive=True))
+            )
+        elif not path.endswith(".gz"):
+            raise ValueError(
+                f"expected a .gz file but got '{path}' — did you mean '@{path}'?"
+            )
+        else:
+            result.append(path)
+    return [os.path.abspath(p) for p in result]
+
+
+def fmt_tokens(n: int) -> str:
+    """Format token count for display (e.g. 878K, 1.8M)."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.0f}K"
+    return str(n)
+
+
+def git_metadata() -> dict:
+    """Capture git commit hash and working-tree state."""
+    meta: dict = {}
+    try:
+        meta["commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        meta["commit_short"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        meta["commit"] = None
+        meta["commit_short"] = None
+
+    try:
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        meta["dirty"] = bool(status)
+    except Exception:
+        meta["dirty"] = None
+
+    return meta
